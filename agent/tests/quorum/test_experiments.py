@@ -6,9 +6,10 @@ import ast
 import inspect
 import json
 import sys
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone
+from multiprocessing import get_context
 from pathlib import Path
 from types import MappingProxyType
 from zoneinfo import ZoneInfo
@@ -16,7 +17,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 import src.quorum.experiments as experiment_module
-from src.governance.ledger import append_record
+from src.governance.ledger import append_record, verify_chain
 from src.quorum import (
     ExperimentAttempt,
     ExperimentEvent,
@@ -85,6 +86,19 @@ def _ledger(tmp_path: Path) -> ExperimentLedger:
     return ExperimentLedger(tmp_path / "experiments.jsonl")
 
 
+def _register_attempt_in_process(
+    path_text: str, spec_payload: dict[str, object], minute: int
+) -> str:
+    """Spawn-safe worker that opens its own ledger and registers one attempt."""
+    ledger = ExperimentLedger(Path(path_text))
+    spec = ExperimentSpec.from_dict(spec_payload)
+    attempt = ledger.register(
+        spec,
+        registered_at=datetime(2026, 1, 1, 0, minute, tzinfo=UTC),
+    )
+    return attempt.attempt_id
+
+
 def test_experiment_module_has_only_clean_core_dependencies() -> None:
     tree = ast.parse(inspect.getsource(experiment_module))
     imported_modules = {
@@ -122,6 +136,33 @@ def test_identical_specs_are_canonical_and_have_same_full_sha256_identity() -> N
     assert forward.fingerprint.startswith("sha256:")
     assert len(forward.fingerprint) == 71
     assert hash(forward) == hash(reverse)
+
+
+def test_scientific_identity_namespace_is_separate_from_serialization_schema() -> None:
+    spec = _spec()
+    identity_payload = spec._scientific_identity_payload()
+    serialized_payload = spec.to_dict()
+
+    assert identity_payload["identity_namespace"] == "quorum-experiment-spec-v1"
+    assert set(identity_payload) == {
+        "identity_namespace",
+        "evaluation_protocol_id",
+        "expert_config_ids",
+        "ensemble_config_id",
+        "target_definition_id",
+        "horizon_bars",
+        "data_snapshot_id",
+        "data_cutoff_at",
+        "universe_id",
+        "cost_model_id",
+        "code_id",
+        "config_id",
+        "random_seed",
+        "trial_family_id",
+    }
+    assert serialized_payload["contract"] == "experiment_spec"
+    assert serialized_payload["schema_version"] == 1
+    assert spec.fingerprint == experiment_module._fingerprint(identity_payload)
 
 
 @pytest.mark.parametrize(
@@ -629,7 +670,7 @@ def test_derived_record_rejects_invented_or_inconsistent_history() -> None:
         ExperimentRecord(attempt, ExperimentState.RUNNING, ())
 
 
-def test_corrupted_or_truncated_records_fail_clearly(tmp_path: Path) -> None:
+def test_partial_trailing_record_fails_clearly(tmp_path: Path) -> None:
     path = tmp_path / "experiments.jsonl"
     ledger = ExperimentLedger(path)
     ledger.register(_spec(), registered_at=_dt(1))
@@ -640,6 +681,60 @@ def test_corrupted_or_truncated_records_fail_clearly(tmp_path: Path) -> None:
         ledger.history()
     with pytest.raises(ExperimentLedgerCorruptionError):
         ledger.register(_spec(), registered_at=_dt(2))
+
+
+def test_interior_record_mutation_fails_chain_validation(tmp_path: Path) -> None:
+    path = tmp_path / "experiments.jsonl"
+    ledger = ExperimentLedger(path)
+    attempt = ledger.register(_spec(), registered_at=_dt(1))
+    ledger.transition(attempt.attempt_id, ExperimentState.RUNNING, occurred_at=_dt(2))
+    ledger.transition(
+        attempt.attempt_id,
+        ExperimentState.FAILED,
+        outcome=ExperimentOutcome(detail="failed"),
+        occurred_at=_dt(3),
+    )
+
+    records = [
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    records[1]["state"] = "interrupted"
+    path.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in records),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ExperimentLedgerCorruptionError, match="corrupt"):
+        ledger.history()
+
+
+def test_clean_complete_suffix_removal_leaves_a_valid_local_prefix(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "experiments.jsonl"
+    ledger = ExperimentLedger(path)
+    attempt = ledger.register(_spec(), registered_at=_dt(1))
+    ledger.transition(attempt.attempt_id, ExperimentState.RUNNING, occurred_at=_dt(2))
+    ledger.transition(
+        attempt.attempt_id,
+        ExperimentState.FAILED,
+        outcome=ExperimentOutcome(detail="failed"),
+        occurred_at=_dt(3),
+    )
+
+    complete_lines = path.read_bytes().splitlines(keepends=True)
+    assert len(complete_lines) == 3
+    path.write_bytes(b"".join(complete_lines[:-1]))
+
+    verification = verify_chain(path)
+    reconstructed = ledger.get(attempt.attempt_id)
+    assert verification.ok
+    assert verification.record_count == 2
+    assert reconstructed.state is ExperimentState.RUNNING
+    assert ledger.history(attempt.attempt_id) == (
+        reconstructed.attempt,
+        *reconstructed.events,
+    )
 
 
 def test_valid_hash_chain_with_invalid_domain_history_fails_closed(
@@ -723,6 +818,38 @@ def test_two_instances_concurrently_preserve_all_registration_and_event_appends(
         reopened.get(attempt_id).state is ExperimentState.COMPLETED
         for attempt_id in attempt_ids
     )
+
+
+def test_spawned_processes_preserve_all_concurrent_registrations(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "process-experiments.jsonl"
+    spec = _spec()
+    process_count = 4
+
+    with ProcessPoolExecutor(
+        max_workers=process_count,
+        mp_context=get_context("spawn"),
+    ) as pool:
+        futures = [
+            pool.submit(
+                _register_attempt_in_process,
+                str(path),
+                spec.to_dict(),
+                index,
+            )
+            for index in range(process_count)
+        ]
+        attempt_ids = [future.result(timeout=30) for future in futures]
+
+    reopened = ExperimentLedger(path)
+    verification = verify_chain(path)
+    assert len(set(attempt_ids)) == process_count
+    assert reopened.count_attempts() == process_count
+    assert len(reopened.history()) == process_count
+    assert {attempt.attempt_id for attempt in reopened.attempts()} == set(attempt_ids)
+    assert verification.ok
+    assert verification.record_count == process_count
 
 
 def test_concurrent_duplicate_attempt_id_has_exactly_one_winner(tmp_path: Path) -> None:

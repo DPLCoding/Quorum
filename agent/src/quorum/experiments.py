@@ -7,6 +7,12 @@ the standard-library-only governance ledger for hash chaining, fsync, and atomic
 appends, while a ledger-scoped lock keeps Quorum state validation and appending in
 one cross-process critical section.
 
+The application API is append-only. The local forward hash chain detects changes
+within the retained history, including modification, interior deletion or
+reordering, malformed or partial records, and hash/sequence discontinuities. It
+cannot prove that complete trailing records were not cleanly removed without an
+external trusted checkpoint or monotonic anchor.
+
 This module does not run evaluations, load data, compute predictions, or import
 backtest, agent, API, frontend, broker, expert, or ensemble implementations.
 """
@@ -54,7 +60,7 @@ from src.quorum.contracts import (
     _thaw_json_value,
 )
 
-_SCHEMA_VERSION = 1
+_EXPERIMENT_SPEC_IDENTITY_NAMESPACE = "quorum-experiment-spec-v1"
 _MAX_OUTCOME_DETAIL_BYTES = 2048
 _ATTEMPT_ID_RE = re.compile(r"^exp_[0-9a-f]{32}$")
 _EVENT_ID_RE = re.compile(r"^evt_[0-9a-f]{32}$")
@@ -237,11 +243,10 @@ class ExperimentSpec:
                 ),
             )
 
-    def _identity_payload(self) -> dict[str, Any]:
-        """Return canonical scientific identity fields only."""
+    def _scientific_identity_payload(self) -> dict[str, Any]:
+        """Return the versioned scientific identity, not persistence metadata."""
         return {
-            "contract": "experiment_spec",
-            "schema_version": _SCHEMA_VERSION,
+            "identity_namespace": _EXPERIMENT_SPEC_IDENTITY_NAMESPACE,
             "evaluation_protocol_id": self.evaluation_protocol_id,
             "expert_config_ids": list(self.expert_config_ids),
             "ensemble_config_id": self.ensemble_config_id,
@@ -264,13 +269,15 @@ class ExperimentSpec:
     @property
     def fingerprint(self) -> str:
         """Full persisted scientific identity, independent of runtime metadata."""
-        return _fingerprint(self._identity_payload())
+        return _fingerprint(self._scientific_identity_payload())
 
     def __eq__(self, other: object) -> bool:
         """Compare scientific identity, normalizing timestamps by instant."""
         if not isinstance(other, ExperimentSpec):
             return NotImplemented
-        return self._identity_payload() == other._identity_payload()
+        return (
+            self._scientific_identity_payload() == other._scientific_identity_payload()
+        )
 
     def __hash__(self) -> int:
         """Hash consistently with scientific equality for in-memory use."""
@@ -897,9 +904,15 @@ class ExperimentLedger:
     """Durable append-only experiment ledger with derived current state.
 
     Cooperating writers using this class are serialized across the complete
-    read/validate/append transaction. The underlying governance ledger also
-    hash-chains and fsyncs each line, so edits, deletion, truncation, or malformed
-    records fail closed on the next read or append.
+    read/validate/append transaction, and no application operation rewrites an
+    existing record. The underlying governance ledger hash-chains and fsyncs each
+    line. Modification, interior deletion or reordering, malformed or partial
+    records, and hash/sequence discontinuities in the retained chain fail closed.
+
+    A clean rollback that removes only complete trailing records leaves a valid
+    prefix and cannot be proven from this local forward chain alone. Detecting that
+    case requires an external trusted checkpoint or monotonic anchor, which Task 2
+    deliberately does not provide.
     """
 
     def __init__(self, path: Path) -> None:

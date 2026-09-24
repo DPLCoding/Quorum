@@ -385,9 +385,12 @@ The experiment spine makes scientific identity distinct from execution history:
 
 - `ExperimentSpec` freezes protocol, expert/model configuration, optional ensemble,
   target and horizon, data snapshot/cutoff, universe, costs, code/config, seed, and
-  trial-family identities. Its full `sha256:` fingerprint is computed only from a
-  canonical representation of those scientific fields. Timestamp identity uses the
-  represented instant; registration wall time is deliberately excluded.
+  trial-family identities. Its full `sha256:` fingerprint is computed from the
+  `quorum-experiment-spec-v1` scientific-identity namespace plus a canonical
+  representation of those scientific fields. That namespace changes only if the
+  meaning of “same scientific experiment” changes; the persistence contract name
+  and schema version are deliberately excluded. Timestamp identity uses the
+  represented instant; registration wall time is also excluded.
 - `ExperimentAttempt` is a separately identified registration (`exp_` plus UUID4),
   so repeated attempts of the same specification remain separately countable.
   Optional immutable parent-attempt lineage records changed specifications without
@@ -398,10 +401,15 @@ The experiment spine makes scientific identity distinct from execution history:
   states cannot reopen or receive a replacement result.
 - `ExperimentLedger` stores registration and event contracts in a hash-chained,
   fsynced JSONL file. The existing standard-library-only governance ledger provides
-  tamper detection and atomic append locking; a Quorum ledger-scoped lock covers the
-  complete read/validate/append transaction for cooperating processes and ledger
-  instances. Invalid, malformed, truncated, or chronologically inconsistent history
-  fails closed.
+  retained-chain tamper evidence and atomic append locking; a Quorum ledger-scoped
+  lock covers the complete read/validate/append transaction for cooperating
+  processes and ledger instances. The application API only appends. Within the
+  retained chain, modification, interior deletion/reordering/insertion, malformed
+  records, partial writes, hash/sequence discontinuities, and chronologically
+  inconsistent history fail closed. A clean rollback of complete trailing records
+  leaves a valid prefix and cannot be proven from the local forward chain alone;
+  that requires an external trusted checkpoint or monotonic anchor, which Task 2
+  does not provide.
 - `ExternalRecordRefs` stores only opaque Hypothesis Registry IDs, Strategy Store
   artifact IDs, stable run-card references, and Quorum artifact IDs. It never copies
   those external records or makes the Quorum core load their databases. Small frozen
