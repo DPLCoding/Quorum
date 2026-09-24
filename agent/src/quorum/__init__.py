@@ -1,4 +1,4 @@
-"""Public scientific contracts for Quorum."""
+"""Public deterministic scientific API for Quorum."""
 
 from src.quorum.contracts import (
     EvaluationMode,
@@ -27,6 +27,7 @@ from src.quorum.experiments import (
     ExternalRecordRefs,
     InvalidExperimentTransition,
 )
+from src.quorum.experts import MeanReversionExpert, MomentumExpert, TrendExpert
 from src.quorum.validation import (
     BoundaryLeakageError,
     ChronologicalEvaluationPlan,
@@ -70,8 +71,11 @@ __all__ = [
     "InsufficientHistoryError",
     "LeakageAudit",
     "MaterializedFold",
+    "MeanReversionExpert",
+    "MomentumExpert",
     "OOFRole",
     "OOFSlot",
     "materialize_chronological_plan",
     "require_clean_boundary",
+    "TrendExpert",
 ]

@@ -61,6 +61,8 @@ def test_package_exports_only_intended_quorum_contracts() -> None:
         "InsufficientHistoryError",
         "LeakageAudit",
         "MaterializedFold",
+        "MeanReversionExpert",
+        "MomentumExpert",
         "OOFRole",
         "OOFSlot",
         "PredictionContext",
@@ -69,6 +71,7 @@ def test_package_exports_only_intended_quorum_contracts() -> None:
         "TimeInterval",
         "materialize_chronological_plan",
         "require_clean_boundary",
+        "TrendExpert",
     }
 
 

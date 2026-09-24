@@ -505,6 +505,38 @@ predictions. The existing `backtest.validation.walk_forward_analysis` remains
 retrospective equity-curve subperiod reporting and is not used as Quorum's
 fit/predict coordinator.
 
+#### Task 4 deterministic V0 experts
+
+Task 4 adds three close-only, parameter-frozen, single-asset experts. Each call
+receives exactly one coordinator-approved historical slice containing `asset`,
+`close`, `event_at`, and `available_at`. The shared boundary requires strictly
+increasing event instants, rejects every row available after `decision_at`, binds
+the terminal event and latest availability to `PredictionContext`, and never sorts,
+drops, fills, or interpolates observations. Task 3 remains responsible for deciding
+which rows the expert may see; experts neither fetch data nor choose an evaluation
+period.
+
+The V0 formulas and identities are frozen:
+
+- Momentum (`quorum.momentum`, `v0.1.0`, `quorum:momentum:v0`) uses the latest
+  21 closes for the 20-bar simple return and emits
+  `clamp((close[t] / close[t-20] - 1) / 0.10, -1, 1)`.
+- Trend (`quorum.trend`, `v0.1.0`, `quorum:trend:v0`) uses arithmetic SMA10 and
+  SMA50 and emits `clamp((SMA10 / SMA50 - 1) / 0.05, -1, 1)`.
+- Mean Reversion (`quorum.mean_reversion`, `v0.1.0`,
+  `quorum:mean-reversion:v0`) uses the latest 20 prices, their sample standard
+  deviation (`ddof=1`), and emits `clamp(-price_zscore / 3, -1, 1)`.
+
+These are asset-isolated time-series formulas: there is no training, optimization,
+cross-sectional normalization, or dependency on another asset. Insufficient
+warmup, a missing close in the active window, or an undefined mean-reversion
+standard deviation produces no prediction rather than neutral evidence. Missing
+closes outside the active window do not affect the formula. V0 scores make no
+probability or confidence claim. Every prediction copies the authoritative
+`event_at`, `available_at`, `decision_at`, horizon, and experiment/split references
+from its context; experts do not write the experiment ledger, ensemble evidence,
+size positions, or execute trades.
+
 ### Portfolio and risk
 
 Base execution normalizes requested gross weight, enforces cash/margin/lot/market
