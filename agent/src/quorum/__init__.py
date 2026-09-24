@@ -27,8 +27,23 @@ from src.quorum.experiments import (
     ExternalRecordRefs,
     InvalidExperimentTransition,
 )
+from src.quorum.validation import (
+    BoundaryLeakageError,
+    ChronologicalEvaluationPlan,
+    ChronologicalValidationError,
+    InsufficientHistoryError,
+    LeakageAudit,
+    MaterializedFold,
+    OOFRole,
+    OOFSlot,
+    materialize_chronological_plan,
+    require_clean_boundary,
+)
 
 __all__ = [
+    "BoundaryLeakageError",
+    "ChronologicalEvaluationPlan",
+    "ChronologicalValidationError",
     "EvaluationMode",
     "EvaluationProtocol",
     "ExperimentAttempt",
@@ -52,4 +67,11 @@ __all__ = [
     "StaticEnsembleConfig",
     "TimeInterval",
     "InvalidExperimentTransition",
+    "InsufficientHistoryError",
+    "LeakageAudit",
+    "MaterializedFold",
+    "OOFRole",
+    "OOFSlot",
+    "materialize_chronological_plan",
+    "require_clean_boundary",
 ]

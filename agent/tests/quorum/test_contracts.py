@@ -36,6 +36,9 @@ NEW_YORK = ZoneInfo("America/New_York")
 
 def test_package_exports_only_intended_quorum_contracts() -> None:
     assert set(quorum_package.__all__) == {
+        "BoundaryLeakageError",
+        "ChronologicalEvaluationPlan",
+        "ChronologicalValidationError",
         "EvaluationMode",
         "EvaluationProtocol",
         "ExperimentAttempt",
@@ -55,10 +58,17 @@ def test_package_exports_only_intended_quorum_contracts() -> None:
         "FinalHoldout",
         "FinalHoldoutState",
         "InvalidExperimentTransition",
+        "InsufficientHistoryError",
+        "LeakageAudit",
+        "MaterializedFold",
+        "OOFRole",
+        "OOFSlot",
         "PredictionContext",
         "SplitManifest",
         "StaticEnsembleConfig",
         "TimeInterval",
+        "materialize_chronological_plan",
+        "require_clean_boundary",
     }
 
 

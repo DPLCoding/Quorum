@@ -428,7 +428,49 @@ The experiment spine makes scientific identity distinct from execution history:
 
 Trial-family queries count every registered attempt regardless of whether it later
 completed, failed, was interrupted, was rejected, or produced no usable result.
-Split materialization and out-of-fold enforcement remain Task 3 responsibilities.
+Split materialization and out-of-fold enforcement are owned by the Task 3
+coordinator below.
+
+#### Task 3 chronological validation coordinator
+
+Task 3 consumes a registered `ExperimentAttempt`, its authoritative
+`EvaluationProtocol`, an explicitly ordered sequence of `TimeInterval` bars, and
+positional forward-label end metadata. The bar axis must already be strictly
+chronological and non-overlapping by represented instant. The coordinator does not
+sort it, assume equal duration, fill market gaps, or read OHLCV values. Consecutive
+positions are coalesced in a manifest only when their temporal boundaries genuinely
+touch, so weekends and other gaps remain visible.
+
+Each ordinary fold orders validation immediately before test and advances the next
+evaluation origin by `step_bars`. Evaluation blocks may not overlap. Expanding mode
+retains every eligible historical row; rolling mode retains at most the most recent
+`train_window_bars` eligible rows. Candidate origins below `minimum_train_bars`
+after exclusions are skipped, and materialization fails closed if no valid fold
+remains.
+
+The `purge_bars` positions immediately before evaluation are explicitly recorded.
+Training labels use closed endpoints: any historical row whose label ends at or
+after the first held-out validation position is additionally purged. The complete
+validation-plus-test block is then audited through
+`src.quantlib.crossvalidation.detect_boundary_leakage`; a dirty report raises and
+cannot become a `MaterializedFold`. Declared embargo positions are recorded
+immediately after test wherever they exist before the final-holdout boundary; they
+are not future training rows for that fold.
+
+Accepted folds retain positional tuples for runtime slicing and use the existing
+`SplitManifest` as persisted temporal truth. Split IDs are full deterministic
+SHA-256 identities over the experiment specification fingerprint, protocol, actual
+timeline instants, label spans, and fold positions. `ChronologicalEvaluationPlan`
+also contains immutable `OOFSlot` assignments with distinct validation/test roles.
+Its constructor requires the assignments to match every materialized held-out row
+exactly and rejects duplicate sample assignments.
+
+Normal generation stops before the locked final holdout. Bars that straddle either
+holdout boundary are rejected rather than clipped, and Task 3 neither opens nor
+evaluates the holdout. It creates authorized OOF slots, not expert scores or fitted
+predictions. The existing `backtest.validation.walk_forward_analysis` remains
+retrospective equity-curve subperiod reporting and is not used as Quorum's
+fit/predict coordinator.
 
 ### Portfolio and risk
 
