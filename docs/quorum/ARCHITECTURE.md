@@ -443,10 +443,11 @@ touch, so weekends and other gaps remain visible.
 
 Each ordinary fold orders validation immediately before test and advances the next
 evaluation origin by `step_bars`. Evaluation blocks may not overlap. Expanding mode
-retains every eligible historical row; rolling mode retains at most the most recent
-`train_window_bars` eligible rows. Candidate origins below `minimum_train_bars`
-after exclusions are skipped, and materialization fails closed if no valid fold
-remains.
+contains every eligible historical row; rolling mode contains exactly the most
+recent eligible window capped by `train_window_bars`. Accepted origins follow the
+declared step schedule. A candidate is skipped only when deterministic purge rules
+leave it below `minimum_train_bars` or its evaluation label reaches the final
+holdout, and materialization fails closed if no valid fold remains.
 
 The `purge_bars` positions immediately before evaluation are explicitly recorded.
 Training labels use closed endpoints: any historical row whose label ends at or
@@ -464,19 +465,32 @@ evaluation block. Materialization fails closed if no candidate survives. Positio
 label ends must identify actual bars in the supplied timeline; out-of-range ends are
 rejected rather than clamped.
 
+A `ChronologicalEvaluationPlan` is not merely an internally consistent collection
+of folds. It is the canonical deterministic realization of a registered
+`ExperimentAttempt`, its `EvaluationProtocol`, the ordinary chronological bar axis,
+and declared label spans. The plan retains the immutable attempt and derives its
+attempt ID and scientific fingerprint from that registration rather than accepting
+independent provenance strings.
+
+One internal derivation produces the complete accepted fold sequence, including
+canonical expanding/rolling training positions, scheduled origins, deterministic
+skips, purge/embargo positions, and split IDs. Public plan construction reruns that
+same derivation and requires every supplied fold to match exactly. Arbitrary fold
+omission, reordering, shifted origins, or clean training-row cherry-picking cannot
+form an accepted plan.
+
 Accepted folds retain positional tuples for runtime slicing and use the existing
 `SplitManifest` as persisted temporal truth. Split IDs are full deterministic
 SHA-256 identities over the experiment specification fingerprint, protocol, actual
-pre-holdout timeline instants, pre-holdout label spans, and fold positions. Metadata
-belonging only to the locked holdout is excluded from ordinary split identity.
-`MaterializedFold` retains the immutable bar axis and ordinary label metadata needed
-to prove that every positional set maps exactly to its corresponding manifest
-intervals. Its leakage audit is recomputed internally and cannot be supplied by a
-caller. `ChronologicalEvaluationPlan` requires every fold to share that context,
-orders folds by their actual first evaluation position, rejects globally overlapping
-evaluation assignments, and contains immutable `OOFSlot` values with distinct
-validation/test roles. Its constructor requires the assignments to match every
-materialized held-out row exactly and rejects duplicate sample assignments.
+pre-holdout timeline instants, pre-holdout label spans, and fold positions. They are
+recomputed during plan validation rather than trusted from a supplied manifest.
+Metadata belonging only to the locked holdout is excluded from ordinary split
+identity. `MaterializedFold` retains the immutable bar axis and ordinary label
+metadata needed to prove that every positional set maps exactly to its corresponding
+manifest intervals. Its leakage audit is recomputed internally and cannot be
+supplied by a caller. Canonical folds mechanically produce immutable `OOFSlot`
+values with distinct validation/test roles; the plan rejects missing, duplicate,
+unknown, or otherwise noncanonical assignments.
 
 Normal generation stops before the locked final holdout. Bars that straddle either
 holdout boundary are rejected rather than clipped, and Task 3 neither opens nor

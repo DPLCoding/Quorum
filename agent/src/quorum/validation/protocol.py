@@ -32,8 +32,6 @@ from src.quorum.experiments import ExperimentAttempt
 
 _SPLIT_IDENTITY_NAMESPACE = "quorum-chronological-split-v1"
 _SPLIT_ID_RE = re.compile(r"^split_[0-9]{4}_[0-9a-f]{64}$")
-_FINGERPRINT_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-_ATTEMPT_ID_RE = re.compile(r"^exp_[0-9a-f]{32}$")
 
 
 def _instant(value: datetime) -> datetime:
@@ -344,11 +342,33 @@ class MaterializedFold:
 
 
 @dataclass(frozen=True, slots=True)
-class ChronologicalEvaluationPlan:
-    """Immutable fold plan and authorized OOF slots for one registered attempt."""
+class _CanonicalFold:
+    """Internal deterministic fold blueprint derived from frozen science inputs."""
 
-    attempt_id: str
-    spec_fingerprint: str
+    fold_index: int
+    split_id: str
+    train_positions: tuple[int, ...]
+    validation_positions: tuple[int, ...]
+    test_positions: tuple[int, ...]
+    purge_positions: tuple[int, ...]
+    embargo_positions: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _CanonicalDerivation:
+    """Normalized ordinary inputs and their only accepted fold sequence."""
+
+    bar_intervals: tuple[TimeInterval, ...]
+    label_end_positions: tuple[int, ...]
+    ordinary_stop: int
+    folds: tuple[_CanonicalFold, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ChronologicalEvaluationPlan:
+    """Canonical fold realization for one immutable experiment registration."""
+
+    attempt: ExperimentAttempt
     protocol: EvaluationProtocol
     bar_intervals: tuple[TimeInterval, ...] = field(repr=False)
     label_end_positions: tuple[int, ...] = field(repr=False)
@@ -356,106 +376,103 @@ class ChronologicalEvaluationPlan:
     oof_slots: tuple[OOFSlot, ...]
 
     def __post_init__(self) -> None:
-        attempt_id = _required_text("attempt_id", self.attempt_id)
-        if not _ATTEMPT_ID_RE.fullmatch(attempt_id):
-            raise ValueError("attempt_id must use the Task 2 UUID-backed format")
-        object.__setattr__(self, "attempt_id", attempt_id)
-        fingerprint = _required_text("spec_fingerprint", self.spec_fingerprint)
-        if not _FINGERPRINT_RE.fullmatch(fingerprint):
-            raise ValueError("spec_fingerprint must be a full SHA-256 identity")
-        object.__setattr__(self, "spec_fingerprint", fingerprint)
-        if not isinstance(self.protocol, EvaluationProtocol):
-            raise TypeError("protocol must be an EvaluationProtocol")
-        if self.protocol.final_holdout.state is not FinalHoldoutState.LOCKED:
-            raise ValueError("ordinary evaluation plans require a locked final holdout")
-        bars = _bar_axis(self.bar_intervals)
-        _reject_holdout_straddles(bars, self.protocol.final_holdout)
-        ordinary_stop = _ordinary_stop(bars, self.protocol.final_holdout)
-        label_ends = _label_ends(
+        derivation = _derive_canonical_folds(
+            self.attempt,
+            self.protocol,
+            self.bar_intervals,
             self.label_end_positions,
-            len(bars),
-            expected_count=ordinary_stop,
         )
-        object.__setattr__(self, "bar_intervals", bars)
-        object.__setattr__(self, "label_end_positions", label_ends)
+        object.__setattr__(self, "bar_intervals", derivation.bar_intervals)
+        object.__setattr__(self, "label_end_positions", derivation.label_end_positions)
+
         folds = tuple(self.folds)
-        if not folds or any(not isinstance(fold, MaterializedFold) for fold in folds):
-            raise ValueError("folds must contain at least one MaterializedFold")
+        if any(not isinstance(fold, MaterializedFold) for fold in folds):
+            raise TypeError("folds must contain only MaterializedFold values")
+        if len(folds) != len(derivation.folds):
+            raise ChronologicalValidationError(
+                "folds must exactly match the canonical accepted-fold sequence"
+            )
         object.__setattr__(self, "folds", folds)
+
         slots = tuple(self.oof_slots)
         if any(not isinstance(slot, OOFSlot) for slot in slots):
             raise TypeError("oof_slots must contain only OOFSlot values")
         object.__setattr__(self, "oof_slots", slots)
 
-        expected_indices = tuple(range(len(folds)))
-        actual_indices = tuple(fold.manifest.fold_index for fold in folds)
-        if actual_indices != expected_indices:
-            raise ValueError("folds must use consecutive chronological fold indices")
-        split_ids = tuple(fold.manifest.split_id for fold in folds)
-        if len(split_ids) != len(set(split_ids)):
-            raise ValueError("fold split IDs must be unique")
-
-        expected_slots: list[OOFSlot] = []
         assigned_evaluation_positions: set[int] = set()
         previous_evaluation_start: int | None = None
-        for fold in folds:
-            manifest = fold.manifest
-            if fold.bar_intervals != bars:
-                raise ValueError("every fold must reference the plan bar axis")
-            if fold.label_end_positions != label_ends:
-                raise ValueError("every fold must reference the plan label metadata")
-            if fold.embargo_size != self.protocol.embargo_bars:
-                raise ValueError("every fold must use the protocol embargo_bars")
-            if manifest.protocol_id != self.protocol.protocol_id:
-                raise ValueError("every fold must reference the plan protocol")
-            if manifest.final_holdout != self.protocol.final_holdout:
-                raise ValueError("every fold must retain the declared final holdout")
-            if manifest.uses_final_holdout:
-                raise ValueError(
-                    "ordinary chronological folds cannot use final holdout"
+        for fold, expected in zip(folds, derivation.folds):
+            if fold.bar_intervals != derivation.bar_intervals:
+                raise ChronologicalValidationError(
+                    "every fold must reference the canonical plan bar axis"
                 )
-            if len(fold.train_positions) < self.protocol.minimum_train_bars:
-                raise ValueError("fold training is below minimum_train_bars")
-            if (
-                self.protocol.mode is EvaluationMode.ROLLING
-                and len(fold.train_positions) > self.protocol.train_window_bars
-            ):
-                raise ValueError("rolling fold exceeds train_window_bars")
-            if len(fold.validation_positions) != self.protocol.validation_bars:
-                raise ValueError("fold validation size does not match protocol")
-            if len(fold.test_positions) != self.protocol.test_bars:
-                raise ValueError("fold test size does not match protocol")
+            if fold.label_end_positions != derivation.label_end_positions:
+                raise ChronologicalValidationError(
+                    "every fold must reference the canonical plan label metadata"
+                )
+            if fold.embargo_size != self.protocol.embargo_bars:
+                raise ChronologicalValidationError(
+                    "every fold must use the protocol embargo_bars"
+                )
 
-            evaluation_start = fold.validation_positions[0]
+            for name in (
+                "train_positions",
+                "validation_positions",
+                "test_positions",
+                "purge_positions",
+                "embargo_positions",
+            ):
+                if getattr(fold, name) != getattr(expected, name):
+                    raise ChronologicalValidationError(
+                        f"{name} must exactly match the canonical fold derivation"
+                    )
+
+            expected_manifest = _manifest_for_canonical_fold(
+                expected,
+                self.protocol,
+                derivation.bar_intervals,
+            )
+            if fold.manifest != expected_manifest:
+                raise ChronologicalValidationError(
+                    "fold manifest must exactly match its canonical derivation"
+                )
+
+            evaluation_start = expected.validation_positions[0]
             if (
                 previous_evaluation_start is not None
                 and evaluation_start <= previous_evaluation_start
             ):
-                raise ValueError("folds must be in chronological evaluation order")
-            previous_evaluation_start = evaluation_start
-            evaluation_positions = set(fold.validation_positions + fold.test_positions)
-            if assigned_evaluation_positions & evaluation_positions:
-                raise ValueError("ordinary fold evaluation positions must not overlap")
-            assigned_evaluation_positions.update(evaluation_positions)
-
-            expected_slots.extend(
-                OOFSlot(
-                    position, manifest.split_id, manifest.fold_index, OOFRole.VALIDATION
+                raise ChronologicalValidationError(
+                    "canonical folds must be in chronological evaluation order"
                 )
-                for position in fold.validation_positions
+            previous_evaluation_start = evaluation_start
+            evaluation_positions = set(
+                expected.validation_positions + expected.test_positions
             )
-            expected_slots.extend(
-                OOFSlot(position, manifest.split_id, manifest.fold_index, OOFRole.TEST)
-                for position in fold.test_positions
-            )
+            if assigned_evaluation_positions & evaluation_positions:
+                raise ChronologicalValidationError(
+                    "canonical ordinary evaluation positions must not overlap"
+                )
+            assigned_evaluation_positions.update(evaluation_positions)
 
         sample_positions = tuple(slot.sample_position for slot in slots)
         if len(sample_positions) != len(set(sample_positions)):
             raise ValueError("an OOF sample position cannot be assigned more than once")
-        if slots != tuple(expected_slots):
-            raise ValueError(
-                "oof_slots must exactly match all fold evaluation positions"
+        expected_slots = _oof_slots_for_canonical_folds(derivation.folds)
+        if slots != expected_slots:
+            raise ChronologicalValidationError(
+                "oof_slots must exactly match the canonical fold assignments"
             )
+
+    @property
+    def attempt_id(self) -> str:
+        """Return the ID of the retained immutable experiment registration."""
+        return self.attempt.attempt_id
+
+    @property
+    def spec_fingerprint(self) -> str:
+        """Return the scientific identity derived from the retained attempt."""
+        return self.attempt.spec_fingerprint
 
     @property
     def final_holdout(self) -> FinalHoldout:
@@ -613,18 +630,13 @@ def _split_id(
     return f"split_{fold_index:04d}_{digest}"
 
 
-def materialize_chronological_plan(
+def _derive_canonical_folds(
     attempt: ExperimentAttempt,
     protocol: EvaluationProtocol,
     bar_intervals: Sequence[TimeInterval],
-    label_end_positions: Sequence[int],
-) -> ChronologicalEvaluationPlan:
-    """Materialize deterministic leakage-audited ordinary chronological folds.
-
-    Early candidate origins that remain below ``minimum_train_bars`` after
-    explicit and label-overlap purging are skipped. If no origin is valid, the
-    function fails closed with :class:`InsufficientHistoryError`.
-    """
+    ordinary_label_end_positions: Sequence[int],
+) -> _CanonicalDerivation:
+    """Derive the only accepted ordinary fold sequence for frozen inputs."""
     if not isinstance(attempt, ExperimentAttempt):
         raise TypeError("attempt must be an ExperimentAttempt")
     if not isinstance(protocol, EvaluationProtocol):
@@ -639,8 +651,13 @@ def materialize_chronological_plan(
         )
 
     bars = _bar_axis(bar_intervals)
-    label_ends = _label_ends(label_end_positions, len(bars))
     _reject_holdout_straddles(bars, protocol.final_holdout)
+    ordinary_stop = _ordinary_stop(bars, protocol.final_holdout)
+    label_ends = _label_ends(
+        ordinary_label_end_positions,
+        len(bars),
+        expected_count=ordinary_stop,
+    )
 
     evaluation_width = protocol.validation_bars + protocol.test_bars
     if protocol.step_bars < evaluation_width:
@@ -649,9 +666,6 @@ def materialize_chronological_plan(
             "evaluation assignments do not overlap"
         )
 
-    stop = _ordinary_stop(bars, protocol.final_holdout)
-    ordinary_bars = bars[:stop]
-    ordinary_label_ends = label_ends[:stop]
     history_target = (
         protocol.minimum_train_bars
         if protocol.mode is EvaluationMode.EXPANDING
@@ -659,19 +673,21 @@ def materialize_chronological_plan(
     )
     assert history_target is not None
     first_evaluation = history_target + protocol.purge_bars
-    last_evaluation = stop - evaluation_width
+    last_evaluation = ordinary_stop - evaluation_width
     if first_evaluation > last_evaluation:
         raise InsufficientHistoryError(
             "no room for declared training, purge, validation, and test bars "
             "before the locked final holdout"
         )
 
-    folds: list[MaterializedFold] = []
-    slots: list[OOFSlot] = []
+    ordinary_bars = bars[:ordinary_stop]
+    canonical_folds: list[_CanonicalFold] = []
     skipped_for_history = 0
     skipped_for_holdout_labels = 0
     for evaluation_start in range(
-        first_evaluation, last_evaluation + 1, protocol.step_bars
+        first_evaluation,
+        last_evaluation + 1,
+        protocol.step_bars,
     ):
         validation = tuple(
             range(evaluation_start, evaluation_start + protocol.validation_bars)
@@ -680,7 +696,7 @@ def materialize_chronological_plan(
         test_end = test_start + protocol.test_bars
         test = tuple(range(test_start, test_end))
         held_out = validation + test
-        if any(label_ends[position] >= stop for position in held_out):
+        if any(label_ends[position] >= ordinary_stop for position in held_out):
             skipped_for_holdout_labels += 1
             continue
 
@@ -706,67 +722,149 @@ def materialize_chronological_plan(
             continue
 
         purge = tuple(sorted((*explicit_purge, *label_purge)))
-        embargo = tuple(range(test_end, min(test_end + protocol.embargo_bars, stop)))
-        fold_index = len(folds)
+        embargo = tuple(
+            range(
+                test_end,
+                min(test_end + protocol.embargo_bars, ordinary_stop),
+            )
+        )
+        fold_index = len(canonical_folds)
         split_id = _split_id(
             fold_index=fold_index,
             attempt=attempt,
             protocol=protocol,
             bars=ordinary_bars,
-            label_ends=ordinary_label_ends,
+            label_ends=label_ends,
             train=train,
             validation=validation,
             test=test,
             purge=purge,
             embargo=embargo,
         )
-        manifest = SplitManifest(
-            protocol_id=protocol.protocol_id,
-            split_id=split_id,
-            fold_index=fold_index,
-            train_intervals=_positions_to_intervals(train, bars),
-            validation_intervals=_positions_to_intervals(validation, bars),
-            test_intervals=_positions_to_intervals(test, bars),
-            purge_intervals=_positions_to_intervals(purge, bars),
-            embargo_intervals=_positions_to_intervals(embargo, bars),
-            final_holdout=protocol.final_holdout,
-            uses_final_holdout=False,
-        )
-        fold = MaterializedFold(
-            manifest=manifest,
-            bar_intervals=bars,
-            label_end_positions=ordinary_label_ends,
-            embargo_size=protocol.embargo_bars,
-            train_positions=train,
-            validation_positions=validation,
-            test_positions=test,
-            purge_positions=purge,
-            embargo_positions=embargo,
-        )
-        folds.append(fold)
-        slots.extend(
-            OOFSlot(position, split_id, fold_index, OOFRole.VALIDATION)
-            for position in validation
-        )
-        slots.extend(
-            OOFSlot(position, split_id, fold_index, OOFRole.TEST) for position in test
+        canonical_folds.append(
+            _CanonicalFold(
+                fold_index=fold_index,
+                split_id=split_id,
+                train_positions=train,
+                validation_positions=validation,
+                test_positions=test,
+                purge_positions=purge,
+                embargo_positions=embargo,
+            )
         )
 
-    if not folds:
+    if not canonical_folds:
         raise InsufficientHistoryError(
             "no valid chronological folds remain after purge and minimum-history "
             "or final-holdout label checks; "
             f"skipped_for_history={skipped_for_history}, "
             f"skipped_for_holdout_labels={skipped_for_holdout_labels}"
         )
-    return ChronologicalEvaluationPlan(
-        attempt_id=attempt.attempt_id,
-        spec_fingerprint=attempt.spec_fingerprint,
-        protocol=protocol,
+    return _CanonicalDerivation(
         bar_intervals=bars,
-        label_end_positions=ordinary_label_ends,
-        folds=tuple(folds),
-        oof_slots=tuple(slots),
+        label_end_positions=label_ends,
+        ordinary_stop=ordinary_stop,
+        folds=tuple(canonical_folds),
+    )
+
+
+def _manifest_for_canonical_fold(
+    fold: _CanonicalFold,
+    protocol: EvaluationProtocol,
+    bars: Sequence[TimeInterval],
+) -> SplitManifest:
+    """Materialize persisted temporal truth from a canonical positional fold."""
+    return SplitManifest(
+        protocol_id=protocol.protocol_id,
+        split_id=fold.split_id,
+        fold_index=fold.fold_index,
+        train_intervals=_positions_to_intervals(fold.train_positions, bars),
+        validation_intervals=_positions_to_intervals(fold.validation_positions, bars),
+        test_intervals=_positions_to_intervals(fold.test_positions, bars),
+        purge_intervals=_positions_to_intervals(fold.purge_positions, bars),
+        embargo_intervals=_positions_to_intervals(fold.embargo_positions, bars),
+        final_holdout=protocol.final_holdout,
+        uses_final_holdout=False,
+    )
+
+
+def _materialize_canonical_fold(
+    fold: _CanonicalFold,
+    protocol: EvaluationProtocol,
+    bars: tuple[TimeInterval, ...],
+    label_ends: tuple[int, ...],
+) -> MaterializedFold:
+    """Create one audited public fold from its canonical blueprint."""
+    return MaterializedFold(
+        manifest=_manifest_for_canonical_fold(fold, protocol, bars),
+        bar_intervals=bars,
+        label_end_positions=label_ends,
+        embargo_size=protocol.embargo_bars,
+        train_positions=fold.train_positions,
+        validation_positions=fold.validation_positions,
+        test_positions=fold.test_positions,
+        purge_positions=fold.purge_positions,
+        embargo_positions=fold.embargo_positions,
+    )
+
+
+def _oof_slots_for_canonical_folds(
+    folds: Sequence[_CanonicalFold],
+) -> tuple[OOFSlot, ...]:
+    """Derive the exact authorized validation/test slots from canonical folds."""
+    slots: list[OOFSlot] = []
+    for fold in folds:
+        slots.extend(
+            OOFSlot(position, fold.split_id, fold.fold_index, OOFRole.VALIDATION)
+            for position in fold.validation_positions
+        )
+        slots.extend(
+            OOFSlot(position, fold.split_id, fold.fold_index, OOFRole.TEST)
+            for position in fold.test_positions
+        )
+    return tuple(slots)
+
+
+def materialize_chronological_plan(
+    attempt: ExperimentAttempt,
+    protocol: EvaluationProtocol,
+    bar_intervals: Sequence[TimeInterval],
+    label_end_positions: Sequence[int],
+) -> ChronologicalEvaluationPlan:
+    """Materialize deterministic leakage-audited ordinary chronological folds.
+
+    Early candidate origins that remain below ``minimum_train_bars`` after
+    explicit and label-overlap purging are skipped. If no origin is valid, the
+    function fails closed with :class:`InsufficientHistoryError`.
+    """
+    if not isinstance(protocol, EvaluationProtocol):
+        raise TypeError("protocol must be an EvaluationProtocol")
+    bars = _bar_axis(bar_intervals)
+    full_label_ends = _label_ends(label_end_positions, len(bars))
+    ordinary_stop = _ordinary_stop(bars, protocol.final_holdout)
+    ordinary_label_ends = full_label_ends[:ordinary_stop]
+    derivation = _derive_canonical_folds(
+        attempt,
+        protocol,
+        bars,
+        ordinary_label_ends,
+    )
+    folds = tuple(
+        _materialize_canonical_fold(
+            fold,
+            protocol,
+            derivation.bar_intervals,
+            derivation.label_end_positions,
+        )
+        for fold in derivation.folds
+    )
+    return ChronologicalEvaluationPlan(
+        attempt=attempt,
+        protocol=protocol,
+        bar_intervals=derivation.bar_intervals,
+        label_end_positions=derivation.label_end_positions,
+        folds=folds,
+        oof_slots=_oof_slots_for_canonical_folds(derivation.folds),
     )
 
 

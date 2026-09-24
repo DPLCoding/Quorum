@@ -32,6 +32,7 @@ from src.quorum.validation import (
     LeakageAudit,
     MaterializedFold,
     OOFRole,
+    OOFSlot,
     materialize_chronological_plan,
     require_clean_boundary,
 )
@@ -130,6 +131,34 @@ def _default_plan() -> (
         _attempt(protocol.protocol_id), protocol, bars, _same_bar_labels(len(bars))
     )
     return bars, protocol, plan
+
+
+def _slots_for_folds(folds: tuple[MaterializedFold, ...]) -> tuple[OOFSlot, ...]:
+    slots: list[OOFSlot] = []
+    for fold in folds:
+        slots.extend(
+            OOFSlot(
+                position,
+                fold.manifest.split_id,
+                fold.manifest.fold_index,
+                OOFRole.VALIDATION,
+            )
+            for position in fold.validation_positions
+        )
+        slots.extend(
+            OOFSlot(
+                position,
+                fold.manifest.split_id,
+                fold.manifest.fold_index,
+                OOFRole.TEST,
+            )
+            for position in fold.test_positions
+        )
+    return tuple(slots)
+
+
+def _forged_split_id(fold_index: int, character: str = "f") -> str:
+    return f"split_{fold_index:04d}_{character * 64}"
 
 
 def test_validation_module_has_only_allowed_dependencies() -> None:
@@ -478,7 +507,7 @@ def test_plan_and_nested_boundaries_are_immutable() -> None:
     assert isinstance(plan.folds[0].train_positions, tuple)
     assert isinstance(plan.oof_slots, tuple)
     with pytest.raises(FrozenInstanceError):
-        plan.attempt_id = "exp_" + ("b" * 32)  # type: ignore[misc]
+        plan.attempt = _attempt()  # type: ignore[misc]
 
 
 @pytest.mark.parametrize("boundary", ["train", "test"])
@@ -551,8 +580,156 @@ def test_plan_rejects_folds_reindexed_out_of_chronological_order() -> None:
         manifest=replace(plan.folds[0].manifest, fold_index=1),
     )
 
-    with pytest.raises(ValueError, match="chronological evaluation order"):
+    with pytest.raises(ChronologicalValidationError, match="canonical"):
         replace(plan, folds=(later, earlier, *plan.folds[2:]))
+
+
+def test_plan_rejects_eligible_expanding_training_row_omission() -> None:
+    bars, _, plan = _default_plan()
+    fold = plan.folds[0]
+    forged_id = _forged_split_id(0, "e")
+    tampered_manifest = replace(
+        fold.manifest,
+        split_id=forged_id,
+        train_intervals=(
+            TimeInterval(bars[0].start, bars[1].end),
+            TimeInterval(bars[3].start, bars[4].end),
+        ),
+    )
+    tampered = replace(
+        fold,
+        manifest=tampered_manifest,
+        train_positions=(0, 1, 3, 4),
+    )
+    folds = (tampered, *plan.folds[1:])
+
+    with pytest.raises(
+        ChronologicalValidationError, match="train_positions.*canonical"
+    ):
+        replace(plan, folds=folds, oof_slots=_slots_for_folds(folds))
+
+
+def test_plan_rejects_clean_noncanonical_rolling_training_subset() -> None:
+    bars = _bars(40)
+    protocol = _protocol(
+        bars,
+        mode=EvaluationMode.ROLLING,
+        minimum_train_bars=4,
+        train_window_bars=4,
+    )
+    plan = materialize_chronological_plan(
+        _attempt(protocol.protocol_id), protocol, bars, _same_bar_labels(len(bars))
+    )
+    fold = plan.folds[1]
+    tampered_train = (0, 2, 5, 7)
+    tampered_manifest = replace(
+        fold.manifest,
+        train_intervals=tuple(bars[position] for position in tampered_train),
+    )
+    tampered = replace(
+        fold,
+        manifest=tampered_manifest,
+        train_positions=tampered_train,
+    )
+    folds = (plan.folds[0], tampered, *plan.folds[2:])
+
+    with pytest.raises(
+        ChronologicalValidationError, match="train_positions.*canonical"
+    ):
+        replace(plan, folds=folds, oof_slots=_slots_for_folds(folds))
+
+
+def test_plan_rejects_omitted_middle_fold_after_superficial_reindexing() -> None:
+    _, _, plan = _default_plan()
+    retained = (*plan.folds[:2], *plan.folds[3:])
+    tampered_folds: list[MaterializedFold] = []
+    for fold_index, fold in enumerate(retained):
+        tampered_folds.append(
+            replace(
+                fold,
+                manifest=replace(
+                    fold.manifest,
+                    fold_index=fold_index,
+                    split_id=_forged_split_id(fold_index, "d"),
+                ),
+            )
+        )
+    folds = tuple(tampered_folds)
+
+    with pytest.raises(ChronologicalValidationError, match="accepted-fold sequence"):
+        replace(plan, folds=folds, oof_slots=_slots_for_folds(folds))
+
+
+def test_plan_rejects_shifted_origin_outside_protocol_step_schedule() -> None:
+    bars = _bars(40)
+    protocol = _protocol(bars, step_bars=5)
+    plan = materialize_chronological_plan(
+        _attempt(protocol.protocol_id), protocol, bars, _same_bar_labels(len(bars))
+    )
+    split_id = _forged_split_id(0, "c")
+    shifted_manifest = SplitManifest(
+        protocol_id=protocol.protocol_id,
+        split_id=split_id,
+        fold_index=0,
+        train_intervals=(TimeInterval(bars[0].start, bars[5].end),),
+        validation_intervals=(TimeInterval(bars[7].start, bars[8].end),),
+        test_intervals=(TimeInterval(bars[9].start, bars[10].end),),
+        purge_intervals=(bars[6],),
+        embargo_intervals=(TimeInterval(bars[11].start, bars[12].end),),
+        final_holdout=protocol.final_holdout,
+        uses_final_holdout=False,
+    )
+    shifted = MaterializedFold(
+        manifest=shifted_manifest,
+        bar_intervals=bars,
+        label_end_positions=plan.label_end_positions,
+        embargo_size=protocol.embargo_bars,
+        train_positions=(0, 1, 2, 3, 4, 5),
+        validation_positions=(7, 8),
+        test_positions=(9, 10),
+        purge_positions=(6,),
+        embargo_positions=(11, 12),
+    )
+    folds = (shifted, *plan.folds[1:])
+
+    with pytest.raises(ChronologicalValidationError, match="canonical"):
+        replace(plan, folds=folds, oof_slots=_slots_for_folds(folds))
+
+
+def test_plan_recomputes_and_rejects_forged_split_identity() -> None:
+    _, _, plan = _default_plan()
+    fold = plan.folds[0]
+    forged_id = _forged_split_id(0)
+    forged = replace(
+        fold,
+        manifest=replace(fold.manifest, split_id=forged_id),
+    )
+    folds = (forged, *plan.folds[1:])
+
+    with pytest.raises(ChronologicalValidationError, match="manifest.*canonical"):
+        replace(plan, folds=folds, oof_slots=_slots_for_folds(folds))
+
+
+@pytest.mark.parametrize("mismatch", ["fingerprint", "protocol"])
+def test_plan_rejects_mismatched_experiment_attempt_provenance(
+    mismatch: str,
+) -> None:
+    _, _, plan = _default_plan()
+    if mismatch == "fingerprint":
+        foreign_spec = replace(plan.attempt.spec, code_id="git:foreign")
+    else:
+        foreign_spec = replace(
+            plan.attempt.spec,
+            evaluation_protocol_id="protocol:foreign",
+        )
+    foreign_attempt = replace(
+        plan.attempt,
+        attempt_id="exp_" + ("b" * 32),
+        spec=foreign_spec,
+    )
+
+    with pytest.raises(ChronologicalValidationError):
+        replace(plan, attempt=foreign_attempt)
 
 
 def test_overlapping_evaluation_configuration_is_rejected() -> None:
