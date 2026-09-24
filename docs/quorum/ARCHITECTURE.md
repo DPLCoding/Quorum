@@ -509,7 +509,8 @@ three-valued enum. Recommended logical prediction fields are:
   `available_at` (latest declared availability time among information used),
   `decision_at` (the prediction cutoff), and `horizon_bars`; the universal
   causality invariant is `available_at <= decision_at`, while no universal order
-  is assumed between event and availability time;
+  is assumed between event and availability time; temporal ordering and identity
+  compare actual instants, while serialization retains the supplied UTC offset;
 - finite `score` in `[-1, 1]`, where sign is direction and magnitude is evidence;
 - optional `probability_up` in `[0, 1]`, only when the value is a calibrated
   probability;
@@ -519,7 +520,8 @@ three-valued enum. Recommended logical prediction fields are:
 
 Use a batch `ExpertResult`/frame for performance while preserving the same validated
 row semantics. Reporting may map the ensemble score through frozen thresholds to
-`BUY/HOLD/SELL`; execution receives the risk layer's numeric target weights.
+`BUY/HOLD/SELL`; reporting thresholds must straddle zero so neutral evidence remains
+inside the HOLD band. Execution receives the risk layer's numeric target weights.
 
 An `ExpertProtocol` should accept prepared, read-only market inputs plus a prediction
 context and return standardized predictions. It must not fetch data, choose folds,

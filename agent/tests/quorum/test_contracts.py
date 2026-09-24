@@ -9,6 +9,7 @@ import sys
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 from types import MappingProxyType
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -30,6 +31,7 @@ from src.quorum import (
 )
 
 UTC = timezone.utc
+NEW_YORK = ZoneInfo("America/New_York")
 
 
 def test_package_exports_only_task_one_contracts() -> None:
@@ -90,6 +92,10 @@ def _prediction(**overrides: object) -> ExpertPrediction:
     }
     values.update(overrides)
     return ExpertPrediction(**values)  # type: ignore[arg-type]
+
+
+def _repeated_hour(minute: int, *, fold: int) -> datetime:
+    return datetime(2026, 11, 1, 1, minute, tzinfo=NEW_YORK, fold=fold)
 
 
 def _locked_holdout() -> FinalHoldout:
@@ -242,6 +248,23 @@ def test_prediction_rejects_information_available_after_decision_cutoff() -> Non
         )
 
 
+def test_dst_fold_rejects_information_later_than_cutoff_by_actual_instant() -> None:
+    decision = _repeated_hour(30, fold=0)
+    later_availability = _repeated_hour(30, fold=1)
+
+    # Python compares these equal because they share one ZoneInfo object, even
+    # though the folds represent distinct instants one hour apart.
+    assert decision == later_availability
+    assert decision.astimezone(UTC) < later_availability.astimezone(UTC)
+
+    with pytest.raises(ValueError, match="decision_at"):
+        _prediction(
+            event_at=decision,
+            available_at=later_availability,
+            decision_at=decision,
+        )
+
+
 def test_equivalent_timezone_instants_are_valid_and_offsets_are_preserved() -> None:
     eastern = timezone(timedelta(hours=-5))
     decision = _dt(1, 10, 16)
@@ -334,6 +357,25 @@ def test_prediction_serialization_is_deterministic_and_strict() -> None:
         ExpertPrediction.from_dict(version_one)
 
 
+@pytest.mark.parametrize("invalid_version", [True, 1.0])
+def test_schema_version_one_requires_an_actual_integer(
+    invalid_version: object,
+) -> None:
+    payload = TimeInterval(_dt(1, 1), _dt(1, 2)).to_dict()
+    payload["schema_version"] = invalid_version
+
+    with pytest.raises(ValueError, match="expected integer 1"):
+        TimeInterval.from_dict(payload)
+
+
+def test_prediction_schema_version_two_rejects_equal_float() -> None:
+    payload = _prediction().to_dict()
+    payload["schema_version"] = 2.0
+
+    with pytest.raises(ValueError, match="expected integer 2"):
+        ExpertPrediction.from_dict(payload)
+
+
 def test_prediction_context_obeys_same_time_and_reference_contract() -> None:
     context = PredictionContext(
         event_at=_dt(1, 10, 9),
@@ -343,7 +385,9 @@ def test_prediction_context_obeys_same_time_and_reference_contract() -> None:
         experiment_id="exp-1",
         split_id="fold-1",
     )
-    assert PredictionContext.from_json(context.to_json()) == context
+    restored = PredictionContext.from_json(context.to_json())
+    assert restored == context
+    assert hash(restored) == hash(context)
     with pytest.raises(ValueError, match="available_at"):
         PredictionContext(
             event_at=_dt(1, 10, 9),
@@ -384,6 +428,58 @@ def test_equivalent_instant_is_a_duplicate_prediction_key() -> None:
     )
     with pytest.raises(ValueError, match="duplicate"):
         ExpertResult((first, second))
+
+
+def test_dst_folds_are_distinct_prediction_keys() -> None:
+    first_fold = _repeated_hour(30, fold=0)
+    second_fold = _repeated_hour(30, fold=1)
+    first = _prediction(
+        event_at=first_fold,
+        available_at=first_fold,
+        decision_at=first_fold,
+    )
+    second = _prediction(
+        event_at=second_fold,
+        available_at=second_fold,
+        decision_at=second_fold,
+    )
+
+    assert first.prediction_key != second.prediction_key
+    assert len(ExpertResult((first, second)).predictions) == 2
+
+
+def test_dst_instant_expressed_in_utc_is_still_a_duplicate_key() -> None:
+    local = _repeated_hour(30, fold=1)
+    utc = local.astimezone(UTC)
+    local_prediction = _prediction(
+        event_at=local,
+        available_at=local,
+        decision_at=local,
+    )
+    utc_prediction = _prediction(
+        event_at=utc,
+        available_at=utc,
+        decision_at=utc,
+    )
+
+    with pytest.raises(ValueError, match="duplicate"):
+        ExpertResult((local_prediction, utc_prediction))
+
+
+def test_dst_prediction_round_trip_preserves_instant_offset_and_equality() -> None:
+    repeated = _repeated_hour(30, fold=1)
+    prediction = _prediction(
+        event_at=repeated,
+        available_at=repeated,
+        decision_at=repeated,
+    )
+    restored = ExpertPrediction.from_json(prediction.to_json())
+
+    assert restored == prediction
+    assert restored.prediction_key == prediction.prediction_key
+    assert restored.event_at.astimezone(UTC) == repeated.astimezone(UTC)
+    assert restored.to_json() == prediction.to_json()
+    assert restored.to_dict()["event_at"].endswith("-05:00")
 
 
 def test_same_event_at_different_decision_cutoffs_is_not_a_duplicate() -> None:
@@ -495,6 +591,27 @@ def test_static_ensemble_rejects_invalid_thresholds(sell: float, buy: float) -> 
         StaticEnsembleConfig((ExpertWeight("momentum", "1", 1.0),), sell, buy)
 
 
+@pytest.mark.parametrize(
+    ("sell", "buy"),
+    [(0.1, 0.2), (-0.2, -0.1), (0.0, 0.1), (-0.1, 0.0)],
+)
+def test_static_ensemble_requires_zero_inside_the_neutral_band(
+    sell: float, buy: float
+) -> None:
+    with pytest.raises(ValueError, match="sell_threshold < 0 < buy_threshold"):
+        StaticEnsembleConfig((ExpertWeight("momentum", "1", 1.0),), sell, buy)
+
+
+def test_static_ensemble_accepts_threshold_range_boundaries_around_zero() -> None:
+    config = StaticEnsembleConfig(
+        (ExpertWeight("momentum", "1", 1.0),),
+        sell_threshold=-1.0,
+        buy_threshold=1.0,
+    )
+    assert config.sell_threshold == -1.0
+    assert config.buy_threshold == 1.0
+
+
 def test_time_interval_is_half_open_timezone_aware_and_serializable() -> None:
     first = TimeInterval(_dt(1, 1), _dt(1, 2))
     adjacent = TimeInterval(_dt(1, 2), _dt(1, 3))
@@ -506,11 +623,45 @@ def test_time_interval_is_half_open_timezone_aware_and_serializable() -> None:
         TimeInterval(_dt(1, 2), _dt(1, 2))
 
 
+def test_dst_interval_rejects_absolute_reverse_despite_wall_clock_order() -> None:
+    start = _repeated_hour(15, fold=1)
+    end = _repeated_hour(45, fold=0)
+    assert start.replace(tzinfo=None) < end.replace(tzinfo=None)
+    assert start.astimezone(UTC) > end.astimezone(UTC)
+
+    with pytest.raises(ValueError, match="earlier"):
+        TimeInterval(start, end)
+
+
+def test_dst_interval_spanning_repeated_hour_uses_absolute_instants() -> None:
+    interval = TimeInterval(
+        _repeated_hour(45, fold=0),
+        _repeated_hour(15, fold=1),
+    )
+    inner = TimeInterval(
+        _repeated_hour(55, fold=0),
+        _repeated_hour(5, fold=1),
+    )
+    restored = TimeInterval.from_json(interval.to_json())
+
+    assert interval.overlaps(inner)
+    assert interval.contains(inner)
+    assert restored == interval
+    assert hash(restored) == hash(interval)
+    assert restored.to_json() == interval.to_json()
+    assert restored.start.astimezone(UTC) == interval.start.astimezone(UTC)
+    assert restored.end.astimezone(UTC) == interval.end.astimezone(UTC)
+    assert restored.to_dict()["start"].endswith("-04:00")
+    assert restored.to_dict()["end"].endswith("-05:00")
+
+
 def test_final_holdout_state_is_unambiguous_and_serializable() -> None:
     locked = _locked_holdout()
     opened = _opened_holdout()
     assert FinalHoldout.from_json(locked.to_json()) == locked
-    assert FinalHoldout.from_json(opened.to_json()) == opened
+    restored_opened = FinalHoldout.from_json(opened.to_json())
+    assert restored_opened == opened
+    assert hash(restored_opened) == hash(opened)
     with pytest.raises(TypeError, match="FinalHoldoutState"):
         FinalHoldout(_dt(3, 1), _dt(4, 1), "maybe locked")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="cannot have"):
@@ -528,6 +679,16 @@ def test_final_holdout_state_is_unambiguous_and_serializable() -> None:
             _dt(4, 1),
             FinalHoldoutState.OPENED,
             accessed_at=_dt(3, 31),
+        )
+
+
+def test_final_holdout_access_uses_absolute_instant_during_dst_fold() -> None:
+    with pytest.raises(ValueError, match="before its end"):
+        FinalHoldout(
+            datetime(2026, 11, 1, 0, 30, tzinfo=NEW_YORK),
+            _repeated_hour(30, fold=1),
+            FinalHoldoutState.OPENED,
+            accessed_at=_repeated_hour(30, fold=0),
         )
 
 
@@ -622,6 +783,50 @@ def test_split_manifest_rejects_overlapping_or_nonchronological_boundaries() -> 
         )
 
 
+def test_split_manifest_requires_validation_to_finish_before_test() -> None:
+    with pytest.raises(ValueError, match="validation intervals must finish"):
+        _manifest(
+            train_intervals=(TimeInterval(_dt(1, 1), _dt(2, 1)),),
+            validation_intervals=(TimeInterval(_dt(2, 20), _dt(2, 25)),),
+            test_intervals=(TimeInterval(_dt(2, 5), _dt(2, 10)),),
+            purge_intervals=(),
+            embargo_intervals=(),
+        )
+
+
+def test_split_manifest_keeps_validation_only_and_test_only_valid() -> None:
+    assert _manifest(test_intervals=()).test_intervals == ()
+    assert _manifest(validation_intervals=()).validation_intervals == ()
+
+
+def test_split_manifest_orders_and_compares_dst_folds_by_instant() -> None:
+    early = TimeInterval(
+        _repeated_hour(10, fold=0),
+        _repeated_hour(20, fold=0),
+    )
+    late = TimeInterval(
+        _repeated_hour(10, fold=1),
+        _repeated_hour(20, fold=1),
+    )
+    manifest = _manifest(
+        train_intervals=(late, early),
+        validation_intervals=(),
+        test_intervals=(TimeInterval(_dt(11, 2), _dt(11, 3)),),
+        purge_intervals=(),
+        embargo_intervals=(),
+    )
+    assert manifest.train_intervals == (early, late)
+
+    with pytest.raises(ValueError, match="training must finish"):
+        _manifest(
+            train_intervals=(late,),
+            validation_intervals=(),
+            test_intervals=(early,),
+            purge_intervals=(),
+            embargo_intervals=(),
+        )
+
+
 def test_split_manifest_rejects_inconsistent_final_holdout_state() -> None:
     with pytest.raises(ValueError, match="OPENED"):
         _manifest(
@@ -636,6 +841,19 @@ def test_split_manifest_rejects_inconsistent_final_holdout_state() -> None:
         _manifest(final_holdout=_opened_holdout(), uses_final_holdout=False)
     with pytest.raises(ValueError, match="locked final holdout"):
         _manifest(test_intervals=(TimeInterval(_dt(3, 5), _dt(3, 10)),))
+
+
+def test_final_holdout_manifest_rejects_test_before_validation() -> None:
+    with pytest.raises(ValueError, match="validation intervals must finish"):
+        _manifest(
+            final_holdout=_opened_holdout(),
+            uses_final_holdout=True,
+            train_intervals=(TimeInterval(_dt(1, 1), _dt(2, 1)),),
+            validation_intervals=(TimeInterval(_dt(4, 2), _dt(4, 5)),),
+            test_intervals=(TimeInterval(_dt(3, 1), _dt(4, 1)),),
+            purge_intervals=(),
+            embargo_intervals=(),
+        )
 
 
 def test_final_holdout_manifest_requires_contained_test_and_no_train_or_validation() -> (

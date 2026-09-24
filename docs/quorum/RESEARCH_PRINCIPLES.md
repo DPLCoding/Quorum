@@ -18,7 +18,9 @@ and any future symbolic-regression layer.
    `available_at <= decision_at`. Execution occurs no earlier than the next
    executable market event specified by the experiment. This timestamp contract
    records the declared boundary; it does not by itself prove that a provider's
-   publication or revision metadata is correct.
+   publication or revision metadata is correct. Temporal ordering and identity use
+   actual instants rather than local wall-clock order; serialization retains the
+   supplied UTC offset.
 3. Time-series evaluation is chronological. Random splits are forbidden unless a
    documented scientific question genuinely makes samples exchangeable.
 4. Forward-looking labels must be purged from adjacent training folds. An embargo

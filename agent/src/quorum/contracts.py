@@ -15,7 +15,7 @@ import json
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from numbers import Integral, Real
 from types import MappingProxyType
@@ -76,9 +76,11 @@ def _require_payload_keys(
         raise ValueError(
             f"expected contract={contract_name!r}, got {data['contract']!r}"
         )
-    if data["schema_version"] != schema_version:
+    actual_version = data["schema_version"]
+    if type(actual_version) is not int or actual_version != schema_version:
         raise ValueError(
-            f"unsupported {contract_name} schema_version " f"{data['schema_version']!r}"
+            f"unsupported {contract_name} schema_version {actual_version!r}; "
+            f"expected integer {schema_version}"
         )
 
 
@@ -159,6 +161,22 @@ def _aware_datetime(name: str, value: Any) -> datetime:
     return value
 
 
+def _instant(value: datetime) -> datetime:
+    """Return a transient UTC key for absolute-instant comparison.
+
+    The original datetime remains stored and serialized unchanged. Normalizing
+    only the comparison key avoids Python's same-``tzinfo`` wall-time behavior
+    during a repeated DST hour, where different ``fold`` values can otherwise
+    compare equal.
+    """
+    return value.astimezone(timezone.utc)
+
+
+def _optional_instant(value: datetime | None) -> datetime | None:
+    """Return an absolute-instant key for an optional datetime."""
+    return _instant(value) if value is not None else None
+
+
 def _parse_datetime(name: str, value: Any) -> datetime:
     """Parse an ISO-8601 datetime and apply the awareness contract."""
     if not isinstance(value, str):
@@ -191,7 +209,7 @@ def _validate_information_time(
     event = _aware_datetime("event_at", event_at)
     available = _aware_datetime("available_at", available_at)
     decision = _aware_datetime("decision_at", decision_at)
-    if available > decision:
+    if _instant(available) > _instant(decision):
         raise ValueError("available_at must not be later than decision_at")
     return event, available, decision
 
@@ -240,7 +258,7 @@ def _immutable_metadata(metadata: Any) -> Mapping[str, Any]:
     return frozen
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, eq=False)
 class PredictionContext:
     """Approved timing and provenance supplied to an expert.
 
@@ -281,6 +299,39 @@ class PredictionContext:
             raise ValueError("split_id requires experiment_id")
         object.__setattr__(self, "experiment_id", experiment_id)
         object.__setattr__(self, "split_id", split_id)
+
+    def __eq__(self, other: object) -> bool:
+        """Compare timestamp fields by represented instant."""
+        if not isinstance(other, PredictionContext):
+            return NotImplemented
+        return (
+            _instant(self.event_at),
+            _instant(self.available_at),
+            _instant(self.decision_at),
+            self.horizon_bars,
+            self.experiment_id,
+            self.split_id,
+        ) == (
+            _instant(other.event_at),
+            _instant(other.available_at),
+            _instant(other.decision_at),
+            other.horizon_bars,
+            other.experiment_id,
+            other.split_id,
+        )
+
+    def __hash__(self) -> int:
+        """Hash consistently with instant-aware equality."""
+        return hash(
+            (
+                _instant(self.event_at),
+                _instant(self.available_at),
+                _instant(self.decision_at),
+                self.horizon_bars,
+                self.experiment_id,
+                self.split_id,
+            )
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """Return a versioned JSON-compatible representation."""
@@ -332,7 +383,7 @@ class PredictionContext:
         return cls.from_dict(_json_mapping(text, "prediction_context"))
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, eq=False)
 class ExpertPrediction:
     """One immutable item of expert evidence.
 
@@ -417,6 +468,40 @@ class ExpertPrediction:
         object.__setattr__(self, "experiment_id", experiment_id)
         object.__setattr__(self, "split_id", split_id)
 
+    def __eq__(self, other: object) -> bool:
+        """Compare scientific fields with instant-aware timestamp equality."""
+        if not isinstance(other, ExpertPrediction):
+            return NotImplemented
+        return (
+            self.expert_id,
+            self.expert_version,
+            self.asset,
+            _instant(self.event_at),
+            _instant(self.available_at),
+            _instant(self.decision_at),
+            self.horizon_bars,
+            self.score,
+            self.probability_up,
+            self.confidence,
+            self.metadata,
+            self.experiment_id,
+            self.split_id,
+        ) == (
+            other.expert_id,
+            other.expert_version,
+            other.asset,
+            _instant(other.event_at),
+            _instant(other.available_at),
+            _instant(other.decision_at),
+            other.horizon_bars,
+            other.score,
+            other.probability_up,
+            other.confidence,
+            other.metadata,
+            other.experiment_id,
+            other.split_id,
+        )
+
     @property
     def prediction_key(self) -> tuple[str, str, str, datetime, datetime, int]:
         """Return the logical row identity used for duplicate detection.
@@ -432,8 +517,8 @@ class ExpertPrediction:
             self.expert_id,
             self.expert_version,
             self.asset,
-            self.event_at,
-            self.decision_at,
+            _instant(self.event_at),
+            _instant(self.decision_at),
             self.horizon_bars,
         )
 
@@ -665,8 +750,10 @@ class StaticEnsembleConfig:
     different version.
 
     ``sell_threshold`` and ``buy_threshold`` define a future reporting-only
-    neutral band. Both lie in ``[-1, 1]`` and ``sell_threshold`` must be strictly
-    less than ``buy_threshold``. This class contains no voting implementation.
+    neutral band. Both lie in ``[-1, 1]`` and must satisfy
+    ``sell_threshold < 0 < buy_threshold`` so the score contract's neutral point
+    is always inside the reporting HOLD region. This class contains no voting
+    implementation.
     """
 
     experts: tuple[ExpertWeight, ...]
@@ -694,8 +781,11 @@ class StaticEnsembleConfig:
         buy = _finite_float(
             "buy_threshold", self.buy_threshold, minimum=-1.0, maximum=1.0
         )
-        if sell >= buy:
-            raise ValueError("sell_threshold must be strictly less than buy_threshold")
+        if not sell < 0.0 < buy:
+            raise ValueError(
+                "reporting thresholds must satisfy sell_threshold < 0 < "
+                "buy_threshold"
+            )
         object.__setattr__(
             self,
             "experts",
@@ -762,7 +852,7 @@ class FinalHoldoutState(str, Enum):
     OPENED = "opened"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, eq=False)
 class TimeInterval:
     """A timezone-aware half-open temporal interval ``[start, end)``."""
 
@@ -772,22 +862,39 @@ class TimeInterval:
     def __post_init__(self) -> None:
         start = _aware_datetime("start", self.start)
         end = _aware_datetime("end", self.end)
-        if start >= end:
+        if _instant(start) >= _instant(end):
             raise ValueError("interval start must be earlier than end")
         object.__setattr__(self, "start", start)
         object.__setattr__(self, "end", end)
+
+    def __eq__(self, other: object) -> bool:
+        """Compare boundaries by represented instant."""
+        if not isinstance(other, TimeInterval):
+            return NotImplemented
+        return (_instant(self.start), _instant(self.end)) == (
+            _instant(other.start),
+            _instant(other.end),
+        )
+
+    def __hash__(self) -> int:
+        """Hash consistently with instant-aware equality."""
+        return hash((_instant(self.start), _instant(self.end)))
 
     def overlaps(self, other: "TimeInterval") -> bool:
         """Return whether two half-open intervals overlap."""
         if not isinstance(other, TimeInterval):
             raise TypeError("other must be a TimeInterval")
-        return self.start < other.end and other.start < self.end
+        return _instant(self.start) < _instant(other.end) and _instant(
+            other.start
+        ) < _instant(self.end)
 
     def contains(self, other: "TimeInterval") -> bool:
         """Return whether this interval fully contains ``other``."""
         if not isinstance(other, TimeInterval):
             raise TypeError("other must be a TimeInterval")
-        return self.start <= other.start and other.end <= self.end
+        return _instant(self.start) <= _instant(other.start) and _instant(
+            other.end
+        ) <= _instant(self.end)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a versioned JSON-compatible representation."""
@@ -820,7 +927,7 @@ class TimeInterval:
         return cls.from_dict(_json_mapping(text, "time_interval"))
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, eq=False)
 class FinalHoldout:
     """Definition and access state of the final half-open holdout interval.
 
@@ -848,9 +955,36 @@ class FinalHoldout:
         if self.accessed_at is None:
             raise ValueError("an opened final holdout requires accessed_at")
         accessed_at = _aware_datetime("accessed_at", self.accessed_at)
-        if accessed_at < self.end:
+        if _instant(accessed_at) < _instant(self.end):
             raise ValueError("final holdout cannot be opened before its end")
         object.__setattr__(self, "accessed_at", accessed_at)
+
+    def __eq__(self, other: object) -> bool:
+        """Compare timestamp fields by represented instant."""
+        if not isinstance(other, FinalHoldout):
+            return NotImplemented
+        return (
+            _instant(self.start),
+            _instant(self.end),
+            self.state,
+            _optional_instant(self.accessed_at),
+        ) == (
+            _instant(other.start),
+            _instant(other.end),
+            other.state,
+            _optional_instant(other.accessed_at),
+        )
+
+    def __hash__(self) -> int:
+        """Hash consistently with instant-aware equality."""
+        return hash(
+            (
+                _instant(self.start),
+                _instant(self.end),
+                self.state,
+                _optional_instant(self.accessed_at),
+            )
+        )
 
     @property
     def interval(self) -> TimeInterval:
@@ -1043,7 +1177,9 @@ def _intervals(name: str, values: Any) -> tuple[TimeInterval, ...]:
     for interval in intervals:
         if not isinstance(interval, TimeInterval):
             raise TypeError(f"{name} must contain only TimeInterval values")
-    ordered = tuple(sorted(intervals, key=lambda item: (item.start, item.end)))
+    ordered = tuple(
+        sorted(intervals, key=lambda item: (_instant(item.start), _instant(item.end)))
+    )
     for previous, current in zip(ordered, ordered[1:]):
         if previous.overlaps(current):
             raise ValueError(f"{name} must not contain overlapping intervals")
@@ -1069,7 +1205,8 @@ class SplitManifest:
     what was declared, while a manifest records the actual half-open intervals.
     Included train/validation/test intervals cannot overlap each other or the
     excluded purge/embargo intervals, and training must finish no later than the
-    earliest validation/test boundary.
+    earliest validation/test boundary. When both validation and test intervals
+    exist, every validation interval must finish no later than the first test.
 
     ``uses_final_holdout=False`` requires a locked, untouched holdout and no
     included interval may overlap it. ``uses_final_holdout=True`` requires an
@@ -1138,8 +1275,21 @@ class SplitManifest:
             self.embargo_intervals,
         )
 
-        first_evaluation = min(interval.start for interval in evaluation)
-        last_training = max(interval.end for interval in self.train_intervals)
+        if self.validation_intervals and self.test_intervals:
+            last_validation = max(
+                _instant(interval.end) for interval in self.validation_intervals
+            )
+            first_test = min(
+                _instant(interval.start) for interval in self.test_intervals
+            )
+            if last_validation > first_test:
+                raise ValueError(
+                    "all validation intervals must finish no later than the first "
+                    "test interval"
+                )
+
+        first_evaluation = min(_instant(interval.start) for interval in evaluation)
+        last_training = max(_instant(interval.end) for interval in self.train_intervals)
         if last_training > first_evaluation:
             raise ValueError(
                 "training must finish no later than the first evaluation interval"
