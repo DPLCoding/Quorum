@@ -379,6 +379,39 @@ Quorum should introduce one append-only `ExperimentRecord` that references the
 existing hypothesis/artifact/run IDs and adds the missing scientific protocol. It
 should not migrate or replace the three mature stores during V0.
 
+#### Task 2 experiment ledger
+
+The experiment spine makes scientific identity distinct from execution history:
+
+- `ExperimentSpec` freezes protocol, expert/model configuration, optional ensemble,
+  target and horizon, data snapshot/cutoff, universe, costs, code/config, seed, and
+  trial-family identities. Its full `sha256:` fingerprint is computed only from a
+  canonical representation of those scientific fields. Timestamp identity uses the
+  represented instant; registration wall time is deliberately excluded.
+- `ExperimentAttempt` is a separately identified registration (`exp_` plus UUID4),
+  so repeated attempts of the same specification remain separately countable.
+  Optional immutable parent-attempt lineage records changed specifications without
+  rewriting their parents.
+- `ExperimentEvent` appends lifecycle evidence. The legal paths are
+  `REGISTERED -> RUNNING -> {COMPLETED, FAILED, INTERRUPTED, REJECTED}` and direct
+  `REGISTERED -> {FAILED, INTERRUPTED, REJECTED}` for setup-time outcomes. Terminal
+  states cannot reopen or receive a replacement result.
+- `ExperimentLedger` stores registration and event contracts in a hash-chained,
+  fsynced JSONL file. The existing standard-library-only governance ledger provides
+  tamper detection and atomic append locking; a Quorum ledger-scoped lock covers the
+  complete read/validate/append transaction for cooperating processes and ledger
+  instances. Invalid, malformed, truncated, or chronologically inconsistent history
+  fails closed.
+- `ExternalRecordRefs` stores only opaque Hypothesis Registry IDs, Strategy Store
+  artifact IDs, stable run-card references, and Quorum artifact IDs. It never copies
+  those external records or makes the Quorum core load their databases. Small frozen
+  terminal metadata is bounded; large metrics and artifacts remain externally
+  referenced.
+
+Trial-family queries count every registered attempt regardless of whether it later
+completed, failed, was interrupted, was rejected, or produced no usable result.
+Split materialization and out-of-fold enforcement remain Task 3 responsibilities.
+
 ### Portfolio and risk
 
 Base execution normalizes requested gross weight, enforces cash/margin/lot/market

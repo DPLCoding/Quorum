@@ -34,16 +34,27 @@ UTC = timezone.utc
 NEW_YORK = ZoneInfo("America/New_York")
 
 
-def test_package_exports_only_task_one_contracts() -> None:
+def test_package_exports_only_intended_quorum_contracts() -> None:
     assert set(quorum_package.__all__) == {
         "EvaluationMode",
         "EvaluationProtocol",
+        "ExperimentAttempt",
+        "ExperimentEvent",
+        "ExperimentHistoryRecord",
+        "ExperimentLedger",
+        "ExperimentLedgerCorruptionError",
+        "ExperimentOutcome",
+        "ExperimentRecord",
+        "ExperimentSpec",
+        "ExperimentState",
         "ExpertPrediction",
         "ExpertProtocol",
         "ExpertResult",
         "ExpertWeight",
+        "ExternalRecordRefs",
         "FinalHoldout",
         "FinalHoldoutState",
+        "InvalidExperimentTransition",
         "PredictionContext",
         "SplitManifest",
         "StaticEnsembleConfig",
