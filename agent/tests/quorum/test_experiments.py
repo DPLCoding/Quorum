@@ -162,6 +162,7 @@ def test_scientific_identity_namespace_is_separate_from_serialization_schema() -
     }
     assert serialized_payload["contract"] == "experiment_spec"
     assert serialized_payload["schema_version"] == 1
+    assert serialized_payload["identity_namespace"] == spec.identity_namespace
     assert spec.fingerprint == experiment_module._fingerprint(identity_payload)
 
 
@@ -202,9 +203,26 @@ def test_spec_round_trip_preserves_dst_instant_and_serialized_offset() -> None:
     restored = ExperimentSpec.from_json(spec.to_json())
 
     assert restored == spec
+    assert restored.identity_namespace == spec.identity_namespace
     assert restored.fingerprint == spec.fingerprint
     assert restored.to_json() == spec.to_json()
     assert restored.to_dict()["data_cutoff_at"].endswith("-05:00")
+
+
+def test_spec_rejects_unknown_scientific_identity_namespace() -> None:
+    payload = _spec().to_dict()
+    payload["identity_namespace"] = "quorum-experiment-spec-v999"
+
+    with pytest.raises(ValueError, match="unsupported identity_namespace"):
+        ExperimentSpec.from_dict(payload)
+
+
+def test_spec_deserialization_requires_persisted_identity_namespace() -> None:
+    payload = _spec().to_dict()
+    del payload["identity_namespace"]
+
+    with pytest.raises(ValueError, match="missing=.*identity_namespace"):
+        ExperimentSpec.from_dict(payload)
 
 
 @pytest.mark.parametrize(
@@ -317,6 +335,13 @@ def test_attempt_and_event_serialization_are_strict_and_instant_aware() -> None:
     restored_attempt = ExperimentAttempt.from_json(attempt.to_json())
     restored_event = ExperimentEvent.from_json(running.to_json())
     assert restored_attempt == attempt
+    assert (
+        restored_attempt.spec.identity_namespace
+        == attempt.spec.identity_namespace
+        == "quorum-experiment-spec-v1"
+    )
+    assert restored_attempt.spec_fingerprint == attempt.spec_fingerprint
+    assert restored_attempt.to_dict()["spec_fingerprint"] == attempt.spec.fingerprint
     assert hash(restored_attempt) == hash(attempt)
     assert restored_event == running
     assert restored_attempt.to_json() == attempt.to_json()
@@ -326,6 +351,25 @@ def test_attempt_and_event_serialization_are_strict_and_instant_aware() -> None:
     invalid["schema_version"] = 1.0
     with pytest.raises(ValueError, match="expected integer 1"):
         ExperimentEvent.from_dict(invalid)
+
+
+def test_attempt_round_trip_uses_persisted_namespace_not_current_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempt = ExperimentAttempt(ATTEMPT_A, _spec(), _dt(1))
+    serialized = attempt.to_json()
+    original_fingerprint = attempt.spec_fingerprint
+
+    monkeypatch.setattr(
+        experiment_module,
+        "_DEFAULT_EXPERIMENT_SPEC_IDENTITY_NAMESPACE",
+        "quorum-experiment-spec-v999",
+    )
+    restored = ExperimentAttempt.from_json(serialized)
+
+    assert restored.spec.identity_namespace == "quorum-experiment-spec-v1"
+    assert restored.spec_fingerprint == original_fingerprint
+    assert restored.to_dict()["spec_fingerprint"] == original_fingerprint
 
 
 def test_attempt_ids_are_immutable_and_invalid_ids_fail_closed() -> None:

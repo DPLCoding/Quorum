@@ -60,7 +60,10 @@ from src.quorum.contracts import (
     _thaw_json_value,
 )
 
-_EXPERIMENT_SPEC_IDENTITY_NAMESPACE = "quorum-experiment-spec-v1"
+_DEFAULT_EXPERIMENT_SPEC_IDENTITY_NAMESPACE = "quorum-experiment-spec-v1"
+_SUPPORTED_EXPERIMENT_SPEC_IDENTITY_NAMESPACES = frozenset(
+    {_DEFAULT_EXPERIMENT_SPEC_IDENTITY_NAMESPACE}
+)
 _MAX_OUTCOME_DETAIL_BYTES = 2048
 _ATTEMPT_ID_RE = re.compile(r"^exp_[0-9a-f]{32}$")
 _EVENT_ID_RE = re.compile(r"^evt_[0-9a-f]{32}$")
@@ -182,7 +185,8 @@ class ExperimentSpec:
     own their detailed payloads; this contract references those payloads rather
     than embedding mutable external records. ``data_cutoff_at`` is an optional
     experiment-level information boundary, not a prediction ``decision_at`` or
-    a split definition.
+    a split definition. ``identity_namespace`` is persisted scientific-identity
+    semantics; the module default applies only when constructing a new spec.
     """
 
     evaluation_protocol_id: str
@@ -198,8 +202,19 @@ class ExperimentSpec:
     config_id: str
     random_seed: int | None
     trial_family_id: str
+    identity_namespace: str = _DEFAULT_EXPERIMENT_SPEC_IDENTITY_NAMESPACE
 
     def __post_init__(self) -> None:
+        identity_namespace = _required_text(
+            "identity_namespace", self.identity_namespace
+        )
+        if identity_namespace not in _SUPPORTED_EXPERIMENT_SPEC_IDENTITY_NAMESPACES:
+            raise ValueError(
+                f"unsupported identity_namespace {identity_namespace!r}; "
+                f"expected one of "
+                f"{sorted(_SUPPORTED_EXPERIMENT_SPEC_IDENTITY_NAMESPACES)!r}"
+            )
+        object.__setattr__(self, "identity_namespace", identity_namespace)
         for name in (
             "evaluation_protocol_id",
             "target_definition_id",
@@ -246,7 +261,7 @@ class ExperimentSpec:
     def _scientific_identity_payload(self) -> dict[str, Any]:
         """Return the versioned scientific identity, not persistence metadata."""
         return {
-            "identity_namespace": _EXPERIMENT_SPEC_IDENTITY_NAMESPACE,
+            "identity_namespace": self.identity_namespace,
             "evaluation_protocol_id": self.evaluation_protocol_id,
             "expert_config_ids": list(self.expert_config_ids),
             "ensemble_config_id": self.ensemble_config_id,
@@ -287,6 +302,7 @@ class ExperimentSpec:
         """Return a versioned JSON-compatible representation."""
         return _payload(
             "experiment_spec",
+            identity_namespace=self.identity_namespace,
             evaluation_protocol_id=self.evaluation_protocol_id,
             expert_config_ids=list(self.expert_config_ids),
             ensemble_config_id=self.ensemble_config_id,
@@ -314,6 +330,7 @@ class ExperimentSpec:
             contract_name="experiment_spec",
             fields=frozenset(
                 {
+                    "identity_namespace",
                     "evaluation_protocol_id",
                     "expert_config_ids",
                     "ensemble_config_id",
@@ -332,6 +349,7 @@ class ExperimentSpec:
         )
         cutoff = data["data_cutoff_at"]
         return cls(
+            identity_namespace=data["identity_namespace"],
             evaluation_protocol_id=data["evaluation_protocol_id"],
             expert_config_ids=data["expert_config_ids"],
             ensemble_config_id=data["ensemble_config_id"],

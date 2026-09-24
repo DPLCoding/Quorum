@@ -391,6 +391,11 @@ The experiment spine makes scientific identity distinct from execution history:
   meaning of “same scientific experiment” changes; the persistence contract name
   and schema version are deliberately excluded. Timestamp identity uses the
   represented instant; registration wall time is also excluded.
+  Each persisted `ExperimentSpec` records both its serialization schema version and
+  its scientific identity namespace. The schema version describes how the record is
+  encoded; the identity namespace defines the semantics of the scientific
+  fingerprint. Historical specs retain their original identity namespace and are
+  never reinterpreted using the current default.
 - `ExperimentAttempt` is a separately identified registration (`exp_` plus UUID4),
   so repeated attempts of the same specification remain separately countable.
   Optional immutable parent-attempt lineage records changed specifications without
