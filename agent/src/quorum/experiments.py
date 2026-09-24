@@ -60,6 +60,7 @@ from src.quorum.contracts import (
     _thaw_json_value,
 )
 
+_EXPERIMENT_SPEC_SCHEMA_VERSION = 2
 _DEFAULT_EXPERIMENT_SPEC_IDENTITY_NAMESPACE = "quorum-experiment-spec-v1"
 _SUPPORTED_EXPERIMENT_SPEC_IDENTITY_NAMESPACES = frozenset(
     {_DEFAULT_EXPERIMENT_SPEC_IDENTITY_NAMESPACE}
@@ -302,6 +303,7 @@ class ExperimentSpec:
         """Return a versioned JSON-compatible representation."""
         return _payload(
             "experiment_spec",
+            schema_version=_EXPERIMENT_SPEC_SCHEMA_VERSION,
             identity_namespace=self.identity_namespace,
             evaluation_protocol_id=self.evaluation_protocol_id,
             expert_config_ids=list(self.expert_config_ids),
@@ -328,6 +330,7 @@ class ExperimentSpec:
         _require_payload_keys(
             data,
             contract_name="experiment_spec",
+            schema_version=_EXPERIMENT_SPEC_SCHEMA_VERSION,
             fields=frozenset(
                 {
                     "identity_namespace",

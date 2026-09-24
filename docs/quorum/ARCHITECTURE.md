@@ -396,6 +396,11 @@ The experiment spine makes scientific identity distinct from execution history:
   encoded; the identity namespace defines the semantics of the scientific
   fingerprint. Historical specs retain their original identity namespace and are
   never reinterpreted using the current default.
+  The current `ExperimentSpec` persistence contract is schema version 2, while its
+  scientific identity namespace remains `quorum-experiment-spec-v1`. Persistence
+  schemas may evolve independently of scientific equivalence. Development-time
+  schema-v1 `ExperimentSpec` payloads are not implicitly migrated because their
+  historical fingerprint semantics are ambiguous.
 - `ExperimentAttempt` is a separately identified registration (`exp_` plus UUID4),
   so repeated attempts of the same specification remain separately countable.
   Optional immutable parent-attempt lineage records changed specifications without

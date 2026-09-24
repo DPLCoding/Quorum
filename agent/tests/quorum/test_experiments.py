@@ -160,8 +160,10 @@ def test_scientific_identity_namespace_is_separate_from_serialization_schema() -
         "random_seed",
         "trial_family_id",
     }
+    assert "contract" not in identity_payload
+    assert "schema_version" not in identity_payload
     assert serialized_payload["contract"] == "experiment_spec"
-    assert serialized_payload["schema_version"] == 1
+    assert serialized_payload["schema_version"] == 2
     assert serialized_payload["identity_namespace"] == spec.identity_namespace
     assert spec.fingerprint == experiment_module._fingerprint(identity_payload)
 
@@ -206,6 +208,7 @@ def test_spec_round_trip_preserves_dst_instant_and_serialized_offset() -> None:
     assert restored.identity_namespace == spec.identity_namespace
     assert restored.fingerprint == spec.fingerprint
     assert restored.to_json() == spec.to_json()
+    assert restored.to_dict()["schema_version"] == 2
     assert restored.to_dict()["data_cutoff_at"].endswith("-05:00")
 
 
@@ -252,11 +255,21 @@ def test_spec_rejects_naive_data_cutoff() -> None:
         _spec(data_cutoff_at=datetime(2026, 1, 10, 16))
 
 
-@pytest.mark.parametrize("invalid_version", [True, 1.0])
+def test_spec_schema_version_one_fails_closed_without_migration() -> None:
+    payload = _spec().to_dict()
+    payload["schema_version"] = 1
+
+    with pytest.raises(
+        ValueError, match="unsupported experiment_spec schema_version 1"
+    ):
+        ExperimentSpec.from_dict(payload)
+
+
+@pytest.mark.parametrize("invalid_version", [True, 1.0, 2.0])
 def test_spec_schema_version_is_type_strict(invalid_version: object) -> None:
     payload = _spec().to_dict()
     payload["schema_version"] = invalid_version
-    with pytest.raises(ValueError, match="expected integer 1"):
+    with pytest.raises(ValueError, match="expected integer 2"):
         ExperimentSpec.from_dict(payload)
 
 
@@ -334,6 +347,7 @@ def test_attempt_and_event_serialization_are_strict_and_instant_aware() -> None:
 
     restored_attempt = ExperimentAttempt.from_json(attempt.to_json())
     restored_event = ExperimentEvent.from_json(running.to_json())
+    attempt_payload = restored_attempt.to_dict()
     assert restored_attempt == attempt
     assert (
         restored_attempt.spec.identity_namespace
@@ -341,7 +355,10 @@ def test_attempt_and_event_serialization_are_strict_and_instant_aware() -> None:
         == "quorum-experiment-spec-v1"
     )
     assert restored_attempt.spec_fingerprint == attempt.spec_fingerprint
-    assert restored_attempt.to_dict()["spec_fingerprint"] == attempt.spec.fingerprint
+    assert attempt_payload["schema_version"] == 1
+    assert attempt_payload["spec"]["schema_version"] == 2
+    assert attempt_payload["spec"]["identity_namespace"] == "quorum-experiment-spec-v1"
+    assert attempt_payload["spec_fingerprint"] == attempt.spec.fingerprint
     assert hash(restored_attempt) == hash(attempt)
     assert restored_event == running
     assert restored_attempt.to_json() == attempt.to_json()
