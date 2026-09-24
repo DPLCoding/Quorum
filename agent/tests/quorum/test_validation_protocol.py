@@ -29,6 +29,8 @@ from src.quorum.validation import (
     ChronologicalEvaluationPlan,
     ChronologicalValidationError,
     InsufficientHistoryError,
+    LeakageAudit,
+    MaterializedFold,
     OOFRole,
     materialize_chronological_plan,
     require_clean_boundary,
@@ -339,6 +341,73 @@ def test_locked_final_holdout_is_physically_fenced() -> None:
     assert bars[32].start == protocol.final_holdout.start
 
 
+@pytest.mark.parametrize(("role", "position"), [("validation", 29), ("test", 31)])
+def test_evaluation_label_reaching_locked_holdout_skips_candidate_fold(
+    role: str,
+    position: int,
+) -> None:
+    bars = _bars(40)
+    protocol = _protocol(
+        bars,
+        minimum_train_bars=4,
+        purge_bars=0,
+        holdout_start_position=32,
+    )
+    labels = list(_same_bar_labels(len(bars)))
+    labels[position] = 33
+
+    plan = materialize_chronological_plan(
+        _attempt(protocol.protocol_id), protocol, bars, labels
+    )
+
+    assert all(position not in fold.validation_positions for fold in plan.folds)
+    assert all(position not in fold.test_positions for fold in plan.folds)
+    assert all(
+        labels[evaluation_position] < 32
+        for fold in plan.folds
+        for evaluation_position in (fold.validation_positions + fold.test_positions)
+    ), role
+
+
+def test_evaluation_labels_resolving_immediately_before_holdout_are_valid() -> None:
+    bars = _bars(40)
+    protocol = _protocol(
+        bars,
+        minimum_train_bars=4,
+        purge_bars=0,
+        holdout_start_position=32,
+    )
+    labels = list(_same_bar_labels(len(bars)))
+    labels[29] = 31
+    labels[31] = 31
+
+    plan = materialize_chronological_plan(
+        _attempt(protocol.protocol_id), protocol, bars, labels
+    )
+
+    last = plan.folds[-1]
+    assert last.validation_positions == (28, 29)
+    assert last.test_positions == (30, 31)
+    assert all(labels[position] < 32 for position in (28, 29, 30, 31))
+
+
+def test_all_candidates_with_holdout_crossing_labels_fail_closed() -> None:
+    bars = _bars(12)
+    protocol = _protocol(
+        bars,
+        minimum_train_bars=4,
+        purge_bars=0,
+        holdout_start_position=8,
+    )
+    labels = list(_same_bar_labels(len(bars)))
+    labels[7] = 8
+
+    with pytest.raises(InsufficientHistoryError, match="final-holdout label checks"):
+        materialize_chronological_plan(
+            _attempt(protocol.protocol_id), protocol, bars, labels
+        )
+
+
 def test_holdout_straddling_bar_is_rejected_without_clipping() -> None:
     bars = _bars(16)
     boundary = bars[10].start + timedelta(minutes=30)
@@ -412,6 +481,80 @@ def test_plan_and_nested_boundaries_are_immutable() -> None:
         plan.attempt_id = "exp_" + ("b" * 32)  # type: ignore[misc]
 
 
+@pytest.mark.parametrize("boundary", ["train", "test"])
+def test_fold_positions_must_exactly_match_manifest_boundaries(boundary: str) -> None:
+    bars, _, plan = _default_plan()
+    fold = plan.folds[0]
+    if boundary == "train":
+        changed_manifest = replace(
+            fold.manifest,
+            train_intervals=(TimeInterval(bars[1].start, bars[4].end),),
+        )
+    else:
+        changed_manifest = replace(
+            fold.manifest,
+            test_intervals=(TimeInterval(bars[12].start, bars[13].end),),
+        )
+
+    with pytest.raises(ChronologicalValidationError, match="does not match"):
+        replace(fold, manifest=changed_manifest)
+
+
+def test_empty_caller_audit_cannot_make_a_dirty_fold_authoritative() -> None:
+    bars = _bars(40)
+    protocol = _protocol(bars)
+    labels = list(_same_bar_labels(len(bars)))
+    labels[4] = 10
+    plan = materialize_chronological_plan(
+        _attempt(protocol.protocol_id), protocol, bars, labels
+    )
+    fold = plan.folds[0]
+    dirty_train = tuple(sorted((*fold.train_positions, 4)))
+    dirty_purge = tuple(position for position in fold.purge_positions if position != 4)
+    dirty_manifest = replace(
+        fold.manifest,
+        train_intervals=(TimeInterval(bars[0].start, bars[8].end),),
+        purge_intervals=(bars[9],),
+    )
+
+    with pytest.raises(TypeError, match="leakage_audit"):
+        MaterializedFold(
+            manifest=dirty_manifest,
+            bar_intervals=bars,
+            label_end_positions=tuple(labels[:32]),
+            embargo_size=protocol.embargo_bars,
+            train_positions=dirty_train,
+            validation_positions=fold.validation_positions,
+            test_positions=fold.test_positions,
+            purge_positions=dirty_purge,
+            embargo_positions=fold.embargo_positions,
+            leakage_audit=LeakageAudit(),  # type: ignore[call-arg]
+        )
+
+    with pytest.raises(BoundaryLeakageError, match="dirty chronological boundary"):
+        replace(
+            fold,
+            manifest=dirty_manifest,
+            train_positions=dirty_train,
+            purge_positions=dirty_purge,
+        )
+
+
+def test_plan_rejects_folds_reindexed_out_of_chronological_order() -> None:
+    _, _, plan = _default_plan()
+    later = replace(
+        plan.folds[1],
+        manifest=replace(plan.folds[1].manifest, fold_index=0),
+    )
+    earlier = replace(
+        plan.folds[0],
+        manifest=replace(plan.folds[0].manifest, fold_index=1),
+    )
+
+    with pytest.raises(ValueError, match="chronological evaluation order"):
+        replace(plan, folds=(later, earlier, *plan.folds[2:]))
+
+
 def test_overlapping_evaluation_configuration_is_rejected() -> None:
     bars = _bars(40)
     protocol = _protocol(bars, validation_bars=2, test_bars=2, step_bars=3)
@@ -456,7 +599,8 @@ def test_split_ids_bind_science_not_repeated_attempt_identity() -> None:
 
     first = materialize_chronological_plan(first_attempt, protocol, bars, labels)
     repeated = materialize_chronological_plan(repeated_attempt, protocol, bars, labels)
-    changed_labels = (*labels[:-1], labels[-1] + 1)
+    changed_labels = list(labels)
+    changed_labels[0] = 1
     changed = materialize_chronological_plan(
         first_attempt, protocol, bars, changed_labels
     )
@@ -466,6 +610,58 @@ def test_split_ids_bind_science_not_repeated_attempt_identity() -> None:
         fold.manifest.split_id for fold in repeated.folds
     )
     assert tuple(fold.manifest.split_id for fold in first.folds) != tuple(
+        fold.manifest.split_id for fold in changed.folds
+    )
+
+
+def test_holdout_only_label_metadata_does_not_change_ordinary_plan_identity() -> None:
+    bars = _bars(40)
+    protocol = _protocol(bars, holdout_start_position=32)
+    attempt = _attempt(protocol.protocol_id)
+    labels = _same_bar_labels(len(bars))
+    holdout_changed = (*labels[:32], *(39 for _ in range(8)))
+
+    baseline = materialize_chronological_plan(attempt, protocol, bars, labels)
+    changed = materialize_chronological_plan(attempt, protocol, bars, holdout_changed)
+
+    assert tuple(
+        (
+            fold.train_positions,
+            fold.validation_positions,
+            fold.test_positions,
+            fold.purge_positions,
+            fold.embargo_positions,
+        )
+        for fold in baseline.folds
+    ) == tuple(
+        (
+            fold.train_positions,
+            fold.validation_positions,
+            fold.test_positions,
+            fold.purge_positions,
+            fold.embargo_positions,
+        )
+        for fold in changed.folds
+    )
+    assert tuple(fold.manifest for fold in baseline.folds) == tuple(
+        fold.manifest for fold in changed.folds
+    )
+    assert baseline.oof_slots == changed.oof_slots
+    assert baseline == changed
+
+
+def test_relevant_pre_holdout_label_metadata_changes_affected_split_identity() -> None:
+    bars = _bars(40)
+    protocol = _protocol(bars, holdout_start_position=32)
+    attempt = _attempt(protocol.protocol_id)
+    labels = _same_bar_labels(len(bars))
+    relevant_change = list(labels)
+    relevant_change[4] = 10
+
+    baseline = materialize_chronological_plan(attempt, protocol, bars, labels)
+    changed = materialize_chronological_plan(attempt, protocol, bars, relevant_change)
+
+    assert tuple(fold.manifest.split_id for fold in baseline.folds) != tuple(
         fold.manifest.split_id for fold in changed.folds
     )
 
@@ -644,4 +840,19 @@ def test_label_span_shape_and_direction_are_strict() -> None:
     with pytest.raises(ValueError, match="cannot end before"):
         materialize_chronological_plan(
             _attempt(protocol.protocol_id), protocol, bars, invalid
+        )
+
+
+@pytest.mark.parametrize("invalid_end", [40, 400])
+def test_label_end_must_reference_a_bar_inside_the_timeline(
+    invalid_end: int,
+) -> None:
+    bars = _bars(40)
+    protocol = _protocol(bars)
+    labels = list(_same_bar_labels(len(bars)))
+    labels[-1] = invalid_end
+
+    with pytest.raises(ValueError, match="inside the known timeline"):
+        materialize_chronological_plan(
+            _attempt(protocol.protocol_id), protocol, bars, labels
         )

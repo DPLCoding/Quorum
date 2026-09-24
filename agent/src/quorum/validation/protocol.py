@@ -11,7 +11,7 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from numbers import Integral
@@ -199,16 +199,32 @@ class MaterializedFold:
     """Runtime positional view paired with its persisted ``SplitManifest``."""
 
     manifest: SplitManifest
+    bar_intervals: tuple[TimeInterval, ...] = field(repr=False)
+    label_end_positions: tuple[int, ...] = field(repr=False)
+    embargo_size: int
     train_positions: tuple[int, ...]
     validation_positions: tuple[int, ...]
     test_positions: tuple[int, ...]
     purge_positions: tuple[int, ...]
     embargo_positions: tuple[int, ...]
-    leakage_audit: LeakageAudit
+    leakage_audit: LeakageAudit = field(init=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.manifest, SplitManifest):
             raise TypeError("manifest must be a SplitManifest")
+        bars = _bar_axis(self.bar_intervals)
+        _reject_holdout_straddles(bars, self.manifest.final_holdout)
+        ordinary_stop = _ordinary_stop(bars, self.manifest.final_holdout)
+        label_ends = _label_ends(
+            self.label_end_positions,
+            len(bars),
+            expected_count=ordinary_stop,
+        )
+        embargo_size = _position("embargo_size", self.embargo_size)
+        object.__setattr__(self, "bar_intervals", bars)
+        object.__setattr__(self, "label_end_positions", label_ends)
+        object.__setattr__(self, "embargo_size", embargo_size)
+
         for name in (
             "train_positions",
             "validation_positions",
@@ -225,10 +241,17 @@ class MaterializedFold:
                     allow_empty=name in {"purge_positions", "embargo_positions"},
                 ),
             )
-        if not isinstance(self.leakage_audit, LeakageAudit):
-            raise TypeError("leakage_audit must be a LeakageAudit")
-        if not self.leakage_audit.clean:
-            raise BoundaryLeakageError("a dirty leakage audit cannot become a fold")
+
+        for name in (
+            "train_positions",
+            "validation_positions",
+            "test_positions",
+            "purge_positions",
+            "embargo_positions",
+        ):
+            positions = getattr(self, name)
+            if positions and positions[-1] >= ordinary_stop:
+                raise ValueError(f"{name} must remain before the locked final holdout")
 
         train = set(self.train_positions)
         validation = set(self.validation_positions)
@@ -252,6 +275,73 @@ class MaterializedFold:
         if self.train_positions[-1] >= first_evaluation:
             raise ValueError("training positions must be strictly before evaluation")
 
+        expected_validation = tuple(
+            range(
+                self.validation_positions[0],
+                self.validation_positions[0] + len(self.validation_positions),
+            )
+        )
+        expected_test = tuple(
+            range(
+                self.validation_positions[-1] + 1,
+                self.validation_positions[-1] + 1 + len(self.test_positions),
+            )
+        )
+        if self.validation_positions != expected_validation:
+            raise ValueError("validation positions must be contiguous")
+        if self.test_positions != expected_test:
+            raise ValueError("test positions must be contiguous and follow validation")
+
+        for position in self.validation_positions + self.test_positions:
+            if label_ends[position] >= ordinary_stop:
+                raise ChronologicalValidationError(
+                    "ordinary evaluation labels must resolve before the locked "
+                    "final holdout"
+                )
+
+        expected_embargo = tuple(
+            range(
+                self.test_positions[-1] + 1,
+                min(
+                    self.test_positions[-1] + 1 + embargo_size,
+                    ordinary_stop,
+                ),
+            )
+        )
+        if self.embargo_positions != expected_embargo:
+            raise ValueError(
+                "embargo_positions must exactly match the declared post-test embargo"
+            )
+
+        position_fields = {
+            "train_intervals": self.train_positions,
+            "validation_intervals": self.validation_positions,
+            "test_intervals": self.test_positions,
+            "purge_intervals": self.purge_positions,
+            "embargo_intervals": self.embargo_positions,
+        }
+        for manifest_name, positions in position_fields.items():
+            expected_intervals = _positions_to_intervals(positions, bars)
+            if getattr(self.manifest, manifest_name) != expected_intervals:
+                raise ChronologicalValidationError(
+                    f"{manifest_name} does not match its authoritative positions"
+                )
+
+        held_out = self.validation_positions + self.test_positions
+        audit = require_clean_boundary(
+            Split(
+                train=np.asarray(self.train_positions, dtype=int),
+                test=np.asarray(held_out, dtype=int),
+                purged=len(self.purge_positions),
+                embargoed=len(self.embargo_positions),
+                test_bounds=(held_out[0], held_out[-1]),
+            ),
+            label_ends,
+            n_samples=ordinary_stop,
+            embargo_size=embargo_size,
+        )
+        object.__setattr__(self, "leakage_audit", audit)
+
 
 @dataclass(frozen=True, slots=True)
 class ChronologicalEvaluationPlan:
@@ -260,6 +350,8 @@ class ChronologicalEvaluationPlan:
     attempt_id: str
     spec_fingerprint: str
     protocol: EvaluationProtocol
+    bar_intervals: tuple[TimeInterval, ...] = field(repr=False)
+    label_end_positions: tuple[int, ...] = field(repr=False)
     folds: tuple[MaterializedFold, ...]
     oof_slots: tuple[OOFSlot, ...]
 
@@ -274,6 +366,18 @@ class ChronologicalEvaluationPlan:
         object.__setattr__(self, "spec_fingerprint", fingerprint)
         if not isinstance(self.protocol, EvaluationProtocol):
             raise TypeError("protocol must be an EvaluationProtocol")
+        if self.protocol.final_holdout.state is not FinalHoldoutState.LOCKED:
+            raise ValueError("ordinary evaluation plans require a locked final holdout")
+        bars = _bar_axis(self.bar_intervals)
+        _reject_holdout_straddles(bars, self.protocol.final_holdout)
+        ordinary_stop = _ordinary_stop(bars, self.protocol.final_holdout)
+        label_ends = _label_ends(
+            self.label_end_positions,
+            len(bars),
+            expected_count=ordinary_stop,
+        )
+        object.__setattr__(self, "bar_intervals", bars)
+        object.__setattr__(self, "label_end_positions", label_ends)
         folds = tuple(self.folds)
         if not folds or any(not isinstance(fold, MaterializedFold) for fold in folds):
             raise ValueError("folds must contain at least one MaterializedFold")
@@ -292,8 +396,16 @@ class ChronologicalEvaluationPlan:
             raise ValueError("fold split IDs must be unique")
 
         expected_slots: list[OOFSlot] = []
+        assigned_evaluation_positions: set[int] = set()
+        previous_evaluation_start: int | None = None
         for fold in folds:
             manifest = fold.manifest
+            if fold.bar_intervals != bars:
+                raise ValueError("every fold must reference the plan bar axis")
+            if fold.label_end_positions != label_ends:
+                raise ValueError("every fold must reference the plan label metadata")
+            if fold.embargo_size != self.protocol.embargo_bars:
+                raise ValueError("every fold must use the protocol embargo_bars")
             if manifest.protocol_id != self.protocol.protocol_id:
                 raise ValueError("every fold must reference the plan protocol")
             if manifest.final_holdout != self.protocol.final_holdout:
@@ -313,6 +425,19 @@ class ChronologicalEvaluationPlan:
                 raise ValueError("fold validation size does not match protocol")
             if len(fold.test_positions) != self.protocol.test_bars:
                 raise ValueError("fold test size does not match protocol")
+
+            evaluation_start = fold.validation_positions[0]
+            if (
+                previous_evaluation_start is not None
+                and evaluation_start <= previous_evaluation_start
+            ):
+                raise ValueError("folds must be in chronological evaluation order")
+            previous_evaluation_start = evaluation_start
+            evaluation_positions = set(fold.validation_positions + fold.test_positions)
+            if assigned_evaluation_positions & evaluation_positions:
+                raise ValueError("ordinary fold evaluation positions must not overlap")
+            assigned_evaluation_positions.update(evaluation_positions)
+
             expected_slots.extend(
                 OOFSlot(
                     position, manifest.split_id, manifest.fold_index, OOFRole.VALIDATION
@@ -364,21 +489,31 @@ def _bar_axis(values: Any) -> tuple[TimeInterval, ...]:
     return bars
 
 
-def _label_ends(values: Any, n_samples: int) -> tuple[int, ...]:
+def _label_ends(
+    values: Any,
+    n_samples: int,
+    *,
+    expected_count: int | None = None,
+) -> tuple[int, ...]:
     if isinstance(values, (str, bytes)):
         raise TypeError("label_end_positions must be a sequence of integers")
     try:
         raw = tuple(values)
     except TypeError as exc:
         raise TypeError("label_end_positions must be a sequence of integers") from exc
-    if len(raw) != n_samples:
+    count = n_samples if expected_count is None else expected_count
+    if len(raw) != count:
         raise ValueError(
-            f"label_end_positions has {len(raw)} entries but timeline has {n_samples}"
+            f"label_end_positions has {len(raw)} entries but expected {count}"
         )
     ends = tuple(_position("label_end_positions", value) for value in raw)
     for start, end in enumerate(ends):
         if end < start:
             raise ValueError("a label cannot end before its observation position")
+        if end >= n_samples:
+            raise ValueError(
+                "label_end_positions must reference a bar inside the known timeline"
+            )
     return ends
 
 
@@ -462,11 +597,11 @@ def _split_id(
         "identity_namespace": _SPLIT_IDENTITY_NAMESPACE,
         "spec_fingerprint": attempt.spec_fingerprint,
         "protocol": _protocol_identity(protocol),
-        "bar_axis": [
+        "ordinary_bar_axis": [
             [_instant(bar.start).isoformat(), _instant(bar.end).isoformat()]
             for bar in bars
         ],
-        "label_end_positions": list(label_ends),
+        "ordinary_label_end_positions": list(label_ends),
         "fold_index": fold_index,
         "train_positions": list(train),
         "validation_positions": list(validation),
@@ -515,6 +650,8 @@ def materialize_chronological_plan(
         )
 
     stop = _ordinary_stop(bars, protocol.final_holdout)
+    ordinary_bars = bars[:stop]
+    ordinary_label_ends = label_ends[:stop]
     history_target = (
         protocol.minimum_train_bars
         if protocol.mode is EvaluationMode.EXPANDING
@@ -532,6 +669,7 @@ def materialize_chronological_plan(
     folds: list[MaterializedFold] = []
     slots: list[OOFSlot] = []
     skipped_for_history = 0
+    skipped_for_holdout_labels = 0
     for evaluation_start in range(
         first_evaluation, last_evaluation + 1, protocol.step_bars
     ):
@@ -542,6 +680,9 @@ def materialize_chronological_plan(
         test_end = test_start + protocol.test_bars
         test = tuple(range(test_start, test_end))
         held_out = validation + test
+        if any(label_ends[position] >= stop for position in held_out):
+            skipped_for_holdout_labels += 1
+            continue
 
         explicit_purge_start = evaluation_start - protocol.purge_bars
         explicit_purge = tuple(range(explicit_purge_start, evaluation_start))
@@ -566,27 +707,13 @@ def materialize_chronological_plan(
 
         purge = tuple(sorted((*explicit_purge, *label_purge)))
         embargo = tuple(range(test_end, min(test_end + protocol.embargo_bars, stop)))
-        quantlib_split = Split(
-            train=np.asarray(train, dtype=int),
-            test=np.asarray(held_out, dtype=int),
-            purged=len(purge),
-            embargoed=len(embargo),
-            test_bounds=(held_out[0], held_out[-1]),
-        )
-        audit = require_clean_boundary(
-            quantlib_split,
-            label_ends,
-            n_samples=len(bars),
-            embargo_size=protocol.embargo_bars,
-        )
-
         fold_index = len(folds)
         split_id = _split_id(
             fold_index=fold_index,
             attempt=attempt,
             protocol=protocol,
-            bars=bars,
-            label_ends=label_ends,
+            bars=ordinary_bars,
+            label_ends=ordinary_label_ends,
             train=train,
             validation=validation,
             test=test,
@@ -607,12 +734,14 @@ def materialize_chronological_plan(
         )
         fold = MaterializedFold(
             manifest=manifest,
+            bar_intervals=bars,
+            label_end_positions=ordinary_label_ends,
+            embargo_size=protocol.embargo_bars,
             train_positions=train,
             validation_positions=validation,
             test_positions=test,
             purge_positions=purge,
             embargo_positions=embargo,
-            leakage_audit=audit,
         )
         folds.append(fold)
         slots.extend(
@@ -626,12 +755,16 @@ def materialize_chronological_plan(
     if not folds:
         raise InsufficientHistoryError(
             "no valid chronological folds remain after purge and minimum-history "
-            f"checks; skipped_origins={skipped_for_history}"
+            "or final-holdout label checks; "
+            f"skipped_for_history={skipped_for_history}, "
+            f"skipped_for_holdout_labels={skipped_for_holdout_labels}"
         )
     return ChronologicalEvaluationPlan(
         attempt_id=attempt.attempt_id,
         spec_fingerprint=attempt.spec_fingerprint,
         protocol=protocol,
+        bar_intervals=bars,
+        label_end_positions=ordinary_label_ends,
         folds=tuple(folds),
         oof_slots=tuple(slots),
     )

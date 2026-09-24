@@ -457,13 +457,26 @@ cannot become a `MaterializedFold`. Declared embargo positions are recorded
 immediately after test wherever they exist before the final-holdout boundary; they
 are not future training rows for that fold.
 
+Ordinary validation and test labels must also resolve entirely before the first
+final-holdout bar. A candidate fold containing an evaluation label whose positional
+end reaches the locked holdout is skipped without clipping or shortening the
+evaluation block. Materialization fails closed if no candidate survives. Positional
+label ends must identify actual bars in the supplied timeline; out-of-range ends are
+rejected rather than clamped.
+
 Accepted folds retain positional tuples for runtime slicing and use the existing
 `SplitManifest` as persisted temporal truth. Split IDs are full deterministic
 SHA-256 identities over the experiment specification fingerprint, protocol, actual
-timeline instants, label spans, and fold positions. `ChronologicalEvaluationPlan`
-also contains immutable `OOFSlot` assignments with distinct validation/test roles.
-Its constructor requires the assignments to match every materialized held-out row
-exactly and rejects duplicate sample assignments.
+pre-holdout timeline instants, pre-holdout label spans, and fold positions. Metadata
+belonging only to the locked holdout is excluded from ordinary split identity.
+`MaterializedFold` retains the immutable bar axis and ordinary label metadata needed
+to prove that every positional set maps exactly to its corresponding manifest
+intervals. Its leakage audit is recomputed internally and cannot be supplied by a
+caller. `ChronologicalEvaluationPlan` requires every fold to share that context,
+orders folds by their actual first evaluation position, rejects globally overlapping
+evaluation assignments, and contains immutable `OOFSlot` values with distinct
+validation/test roles. Its constructor requires the assignments to match every
+materialized held-out row exactly and rejects duplicate sample assignments.
 
 Normal generation stops before the locked final holdout. Bars that straddle either
 holdout boundary are rejected rather than clipped, and Task 3 neither opens nor
