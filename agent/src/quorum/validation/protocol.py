@@ -833,6 +833,10 @@ def materialize_chronological_plan(
 ) -> ChronologicalEvaluationPlan:
     """Materialize deterministic leakage-audited ordinary chronological folds.
 
+    ``bar_intervals`` is the full supplied timeline, while
+    ``label_end_positions`` must contain exactly the pre-holdout ordinary prefix.
+    Locked-holdout label metadata is neither accepted nor inspected.
+
     Early candidate origins that remain below ``minimum_train_bars`` after
     explicit and label-overlap purging are skipped. If no origin is valid, the
     function fails closed with :class:`InsufficientHistoryError`.
@@ -840,9 +844,13 @@ def materialize_chronological_plan(
     if not isinstance(protocol, EvaluationProtocol):
         raise TypeError("protocol must be an EvaluationProtocol")
     bars = _bar_axis(bar_intervals)
-    full_label_ends = _label_ends(label_end_positions, len(bars))
+    _reject_holdout_straddles(bars, protocol.final_holdout)
     ordinary_stop = _ordinary_stop(bars, protocol.final_holdout)
-    ordinary_label_ends = full_label_ends[:ordinary_stop]
+    ordinary_label_ends = _label_ends(
+        label_end_positions,
+        len(bars),
+        expected_count=ordinary_stop,
+    )
     derivation = _derive_canonical_folds(
         attempt,
         protocol,

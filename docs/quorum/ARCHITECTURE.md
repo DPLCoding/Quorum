@@ -465,6 +465,12 @@ evaluation block. Materialization fails closed if no candidate survives. Positio
 label ends must identify actual bars in the supplied timeline; out-of-range ends are
 rejected rather than clamped.
 
+Ordinary chronological planning receives the full bar axis but only pre-holdout
+label metadata. Label metadata for the locked final holdout is neither required nor
+accepted by the ordinary coordinator. The required label sequence therefore has
+exactly `ordinary_stop` entries, which physically prevents ordinary fold derivation
+and split identity from depending on holdout outcomes.
+
 A `ChronologicalEvaluationPlan` is not merely an internally consistent collection
 of folds. It is the canonical deterministic realization of a registered
 `ExperimentAttempt`, its `EvaluationProtocol`, the ordinary chronological bar axis,
