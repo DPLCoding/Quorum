@@ -8,7 +8,7 @@ import json
 import socket
 import subprocess
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -170,6 +170,15 @@ def test_end_to_end_acceptance_proves_oof_execution_and_artifacts(
             assert actual_audit["unauthorized_decision_fill_count"] == 0
             assert actual_audit["terminal_liquidation_fill_count"] == 1
             assert actual_audit["terminal_liquidation_exempt"] is True
+            assert actual_audit["position_ledger_reconciled"] is True
+            assert len(actual_audit["target_transition_execution"]) == 10
+            assert all(
+                row["target_transition_attributed"]
+                for row in actual_audit["target_transition_execution"]
+            )
+            assert actual_audit["terminal_liquidation_at"] == [
+                actual_audit["final_execution_at"]
+            ]
             assert set(actual_audit["decision_fill_timestamps"]) <= set(
                 actual_audit["authorized_execution_at"]
             )
@@ -252,37 +261,93 @@ def test_existing_vibe_run_consumer_reads_fold_artifacts(
     assert response.run_card == _strict_json(run_dir / "run_card.json")
 
 
-def test_unauthorized_later_signal_fill_fails_closed(
+def test_fill_shifted_to_another_authorized_bar_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     original_read_fills = acceptance._read_fills
+    original_causality = acceptance._theoretical_target_causality_rows
     moved_signal_fill = False
+    moved_timestamp: str | None = None
+    authorized_timestamps: set[str] = set()
+
+    def capture_causality(*args, **kwargs):
+        rows = original_causality(*args, **kwargs)
+        authorized_timestamps.update(row["execution_at"] for row in rows)
+        return rows
 
     def read_fills_with_late_signal(path: Path):
-        nonlocal moved_signal_fill
+        nonlocal moved_signal_fill, moved_timestamp
         fills = original_read_fills(path)
         if moved_signal_fill:
             return fills
         for fill in fills:
             if fill["reason"] == "signal":
-                fill["timestamp"] = (
-                    datetime.fromisoformat(fill["timestamp"]) + timedelta(days=30)
+                moved_timestamp = (
+                    datetime.fromisoformat(fill["timestamp"]) + acceptance.BAR_DURATION
                 ).isoformat()
+                fill["timestamp"] = moved_timestamp
+                fill["bar_idx"] += 1
                 moved_signal_fill = True
                 break
         return fills
 
+    monkeypatch.setattr(
+        acceptance,
+        "_theoretical_target_causality_rows",
+        capture_causality,
+    )
     monkeypatch.setattr(acceptance, "_read_fills", read_fills_with_late_signal)
     output_dir = tmp_path / "unauthorized-fill"
 
     with pytest.raises(
         ValueError,
-        match="actual signal fill occurred at an unauthorized causal execution bar",
+        match="decision fills are not attributable to the requested open transition",
     ):
         acceptance.run_v0_acceptance(output_dir)
 
     assert moved_signal_fill is True
+    assert moved_timestamp in authorized_timestamps
+    assert (
+        ExperimentLedger(output_dir / "experiment_ledger.jsonl")
+        .get(acceptance.ATTEMPT_ID)
+        .state
+        is ExperimentState.FAILED
+    )
+
+
+def test_terminal_liquidation_before_final_bar_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    original_read_fills = acceptance._read_fills
+    moved_terminal_fill = False
+
+    def read_fills_with_early_terminal(path: Path):
+        nonlocal moved_terminal_fill
+        fills = original_read_fills(path)
+        if moved_terminal_fill:
+            return fills
+        for fill in fills:
+            if fill["reason"] == "end_of_backtest":
+                fill["timestamp"] = (
+                    datetime.fromisoformat(fill["timestamp"]) - acceptance.BAR_DURATION
+                ).isoformat()
+                fill["bar_idx"] -= 1
+                moved_terminal_fill = True
+                break
+        return fills
+
+    monkeypatch.setattr(acceptance, "_read_fills", read_fills_with_early_terminal)
+    output_dir = tmp_path / "early-terminal-fill"
+
+    with pytest.raises(
+        ValueError,
+        match="terminal liquidation must occur at the final execution-frame timestamp",
+    ):
+        acceptance.run_v0_acceptance(output_dir)
+
+    assert moved_terminal_fill is True
     assert (
         ExperimentLedger(output_dir / "experiment_ledger.jsonl")
         .get(acceptance.ATTEMPT_ID)

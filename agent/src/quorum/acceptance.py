@@ -651,46 +651,170 @@ def _audit_actual_fill_execution(
     fills: Sequence[Mapping[str, Any]],
     theoretical_target_causality: Sequence[Mapping[str, Any]],
     cost_mode: str,
+    execution_frame: pd.DataFrame,
+    target_positions: pd.DataFrame,
+    actual_positions: pd.DataFrame,
+    equity: pd.DataFrame,
 ) -> dict[str, Any]:
-    """Fail closed unless every decision-driven fill uses an authorized bar.
+    """Bind immutable fills to the exact requested transition and engine state.
 
     ``end_of_backtest`` is deliberately excluded from Quorum decision-fill
     causality: it is the engine's terminal accounting liquidation.  The V0
     rebalance engine can use both ``signal`` (open/flip) and
-    ``target_rebalance`` (delta adjustment), so both reasons are audited.
+    ``target_rebalance`` (delta adjustment), so both reasons are audited.  The
+    cumulative signed fill ledger must also reproduce the persisted actual
+    position at every bar; membership in a fold-wide timestamp set is not
+    sufficient.
     """
+
+    def artifact_values(
+        artifact: pd.DataFrame,
+        column: str,
+        label: str,
+    ) -> dict[int, float]:
+        if column not in artifact.columns:
+            raise ValueError(f"{label} is missing column {column!r}")
+        timestamps = pd.to_datetime(artifact.index, utc=True, errors="raise")
+        if timestamps.has_duplicates:
+            raise ValueError(f"{label} contains duplicate timestamps")
+        values: dict[int, float] = {}
+        for timestamp, raw_value in zip(timestamps, artifact[column]):
+            value = float(raw_value)
+            if not math.isfinite(value):
+                raise ValueError(f"{label} contains a non-finite value")
+            values[int(timestamp.value)] = value
+        return values
+
+    def direction(value: float) -> int:
+        if value > 1e-12:
+            return 1
+        if value < -1e-12:
+            return -1
+        return 0
+
+    def transition_kind(previous: float, requested: float) -> str:
+        previous_direction = direction(previous)
+        requested_direction = direction(requested)
+        if previous_direction == 0 and requested_direction == 0:
+            return "flat_noop"
+        if previous_direction == 0:
+            return "open"
+        if requested_direction == 0:
+            return "close"
+        if previous_direction != requested_direction:
+            return "flip"
+        if math.isclose(previous, requested, rel_tol=0.0, abs_tol=1e-12):
+            return "unchanged"
+        return "same_direction_resize"
+
+    execution_instants = tuple(
+        int(timestamp.value) for timestamp in execution_frame.index
+    )
+    if not execution_instants:
+        raise ValueError("actual fill audit requires a non-empty execution frame")
+    execution_position_by_ns = {
+        timestamp_ns: position
+        for position, timestamp_ns in enumerate(execution_instants)
+    }
+    if len(execution_position_by_ns) != len(execution_instants):
+        raise ValueError("execution frame contains duplicate timestamps")
+
+    target_by_ns = artifact_values(
+        target_positions,
+        ASSET,
+        "target_positions.csv",
+    )
+    actual_weight_by_ns = artifact_values(
+        actual_positions,
+        ASSET,
+        "positions.csv",
+    )
+    equity_by_ns = artifact_values(equity, "equity", "equity.csv")
+    expected_instants = set(execution_instants)
+    for label, observed in (
+        ("target_positions.csv", target_by_ns),
+        ("positions.csv", actual_weight_by_ns),
+        ("equity.csv", equity_by_ns),
+    ):
+        if set(observed) != expected_instants:
+            raise ValueError(f"{label} timestamps do not match the execution frame")
+
+    close_by_ns: dict[int, float] = {}
+    for timestamp, raw_close in execution_frame["close"].items():
+        close = float(raw_close)
+        if not math.isfinite(close) or close <= 0.0:
+            raise ValueError("execution frame contains an invalid close price")
+        close_by_ns[int(timestamp.value)] = close
+
     authorized_by_ns: dict[int, str] = {}
+    theoretical_target_by_ns: dict[int, float] = {}
     for row in theoretical_target_causality:
         if row.get("causal") is not True:
             raise ValueError("theoretical target causality is not established")
         timestamp = pd.Timestamp(row["execution_at"])
         if timestamp.tzinfo is None:
             raise ValueError("authorized execution timestamp must be timezone-aware")
-        authorized_by_ns[int(timestamp.value)] = timestamp.isoformat()
-    if not authorized_by_ns:
-        raise ValueError("actual fill audit has no authorized execution bars")
+        timestamp_ns = int(timestamp.value)
+        if timestamp_ns in authorized_by_ns:
+            raise ValueError(
+                "theoretical target causality has duplicate execution bars"
+            )
+        authorized_by_ns[timestamp_ns] = timestamp.isoformat()
+        theoretical_target_by_ns[timestamp_ns] = float(row["final_target_weight"])
+    if set(authorized_by_ns) != set(execution_instants[1:]):
+        raise ValueError(
+            "authorized executions must be exactly the shifted target bars"
+        )
+    if not math.isclose(
+        target_by_ns[execution_instants[0]],
+        0.0,
+        rel_tol=0.0,
+        abs_tol=1e-15,
+    ):
+        raise ValueError("the first execution-frame target must be the shifted zero")
 
     reason_counts = {reason: 0 for reason in sorted(_DECISION_FILL_REASONS)}
     decision_fill_timestamps: list[str] = []
     decision_fill_timestamp_ns: list[int] = []
-    terminal_liquidation_count = 0
+    decision_fills_by_ns: dict[int, list[Mapping[str, Any]]] = {
+        timestamp_ns: [] for timestamp_ns in execution_instants
+    }
+    terminal_fills: list[Mapping[str, Any]] = []
+    final_execution_ns = execution_instants[-1]
     for fill in fills:
         reason = fill.get("reason")
+        if fill.get("symbol") != ASSET:
+            raise ValueError(f"{cost_mode} fill has an unexpected asset")
+        timestamp = pd.Timestamp(fill.get("timestamp"))
+        if timestamp.tzinfo is None:
+            raise ValueError(f"{cost_mode} fill timestamp must be timezone-aware")
+        timestamp_ns = int(timestamp.value)
+        if timestamp_ns not in execution_position_by_ns:
+            raise ValueError(
+                f"{cost_mode} fill falls outside the execution frame: "
+                f"{timestamp.isoformat()}"
+            )
+        bar_idx = fill.get("bar_idx")
+        if isinstance(bar_idx, bool) or not isinstance(bar_idx, int):
+            raise ValueError(f"{cost_mode} fill has an invalid bar index")
+        if bar_idx != execution_position_by_ns[timestamp_ns]:
+            raise ValueError(f"{cost_mode} fill timestamp and bar index disagree")
+        signed_quantity = float(fill.get("signed_quantity"))
+        if not math.isfinite(signed_quantity) or abs(signed_quantity) <= 1e-12:
+            raise ValueError(f"{cost_mode} fill has an invalid signed quantity")
+
         if reason == _TERMINAL_FILL_REASON:
-            terminal_liquidation_count += 1
+            if timestamp_ns != final_execution_ns:
+                raise ValueError(
+                    f"{cost_mode} terminal liquidation must occur at the final "
+                    "execution-frame timestamp"
+                )
+            terminal_fills.append(fill)
             continue
         if reason not in _DECISION_FILL_REASONS:
             raise ValueError(
                 f"{cost_mode} contains unexpected non-terminal fill reason {reason!r}"
             )
-        if fill.get("symbol") != ASSET:
-            raise ValueError(f"{cost_mode} decision fill has an unexpected asset")
-        timestamp = pd.Timestamp(fill.get("timestamp"))
-        if timestamp.tzinfo is None:
-            raise ValueError(
-                f"{cost_mode} decision fill timestamp must be timezone-aware"
-            )
-        timestamp_ns = int(timestamp.value)
         if timestamp_ns not in authorized_by_ns:
             raise ValueError(
                 f"{cost_mode} actual {reason} fill occurred at an unauthorized "
@@ -699,6 +823,129 @@ def _audit_actual_fill_execution(
         reason_counts[str(reason)] += 1
         decision_fill_timestamps.append(timestamp.isoformat())
         decision_fill_timestamp_ns.append(timestamp_ns)
+        decision_fills_by_ns[timestamp_ns].append(fill)
+
+    transition_rows: list[dict[str, Any]] = []
+    cumulative_signed_quantity = 0.0
+    for position, timestamp_ns in enumerate(execution_instants):
+        timestamp = pd.Timestamp(execution_frame.index[position]).isoformat()
+        requested_target = target_by_ns[timestamp_ns]
+        fills_at_timestamp = decision_fills_by_ns[timestamp_ns]
+        if position > 0:
+            previous_target = target_by_ns[execution_instants[position - 1]]
+            kind = transition_kind(previous_target, requested_target)
+            theoretical_target = theoretical_target_by_ns[timestamp_ns]
+            if not math.isclose(
+                requested_target,
+                theoretical_target,
+                rel_tol=0.0,
+                abs_tol=1e-15,
+            ):
+                raise ValueError(
+                    f"{cost_mode} requested target does not match its causal "
+                    f"Quorum target at {timestamp}"
+                )
+
+            signal_fills = [
+                fill for fill in fills_at_timestamp if fill["reason"] == "signal"
+            ]
+            rebalance_fills = [
+                fill
+                for fill in fills_at_timestamp
+                if fill["reason"] == "target_rebalance"
+            ]
+            signal_actions = [str(fill.get("action")) for fill in signal_fills]
+            if kind == "open":
+                expected_signal_actions = ["open"]
+            elif kind == "close":
+                expected_signal_actions = ["close"]
+            elif kind == "flip":
+                expected_signal_actions = ["close", "open"]
+            else:
+                expected_signal_actions = []
+            if signal_actions != expected_signal_actions or (
+                expected_signal_actions and rebalance_fills
+            ):
+                raise ValueError(
+                    f"{cost_mode} decision fills are not attributable to the "
+                    f"requested {kind} transition at {timestamp}"
+                )
+            if kind in {"flat_noop", "open", "close", "flip"} and (rebalance_fills):
+                raise ValueError(
+                    f"{cost_mode} target-rebalance fill is incompatible with "
+                    f"the requested {kind} transition at {timestamp}"
+                )
+            if kind in {"unchanged", "same_direction_resize"}:
+                if len(rebalance_fills) > 1 or any(
+                    fill.get("action") not in {"increase", "reduce"}
+                    for fill in rebalance_fills
+                ):
+                    raise ValueError(
+                        f"{cost_mode} resize fills are invalid at {timestamp}"
+                    )
+            requested_direction = direction(requested_target)
+            expected_signal_direction = (
+                -direction(previous_target) if kind == "close" else requested_direction
+            )
+            for fill in signal_fills:
+                if (
+                    direction(float(fill["signed_quantity"]))
+                    != expected_signal_direction
+                ):
+                    raise ValueError(
+                        f"{cost_mode} signal fill direction does not match the "
+                        f"requested target at {timestamp}"
+                    )
+
+            transition_rows.append(
+                {
+                    "execution_at": timestamp,
+                    "previous_requested_target_weight": previous_target,
+                    "requested_target_weight": requested_target,
+                    "transition_kind": kind,
+                    "decision_fill_count": len(fills_at_timestamp),
+                    "decision_fill_reasons": [
+                        str(fill["reason"]) for fill in fills_at_timestamp
+                    ],
+                    "decision_fill_actions": [
+                        str(fill["action"]) for fill in fills_at_timestamp
+                    ],
+                    "target_transition_attributed": True,
+                }
+            )
+
+        for fill in fills_at_timestamp:
+            cumulative_signed_quantity += float(fill["signed_quantity"])
+        pre_terminal_quantity = cumulative_signed_quantity
+        if timestamp_ns == final_execution_ns:
+            expected_terminal_count = 0 if abs(pre_terminal_quantity) <= 1e-8 else 1
+            if len(terminal_fills) != expected_terminal_count:
+                raise ValueError(
+                    f"{cost_mode} terminal liquidation count does not match the "
+                    "open position at the final execution bar"
+                )
+            for fill in terminal_fills:
+                if fill.get("action") != "close":
+                    raise ValueError(
+                        f"{cost_mode} terminal liquidation must be a close fill"
+                    )
+                cumulative_signed_quantity += float(fill["signed_quantity"])
+
+        actual_quantity = (
+            actual_weight_by_ns[timestamp_ns]
+            * equity_by_ns[timestamp_ns]
+            / close_by_ns[timestamp_ns]
+        )
+        if not math.isclose(
+            cumulative_signed_quantity,
+            actual_quantity,
+            rel_tol=0.0,
+            abs_tol=1e-8,
+        ):
+            raise ValueError(
+                f"{cost_mode} fill ledger does not reproduce the actual position "
+                f"at {timestamp}"
+            )
 
     return {
         "passed": True,
@@ -713,7 +960,11 @@ def _audit_actual_fill_execution(
         "decision_fill_timestamps": decision_fill_timestamps,
         "decision_fill_timestamp_ns": decision_fill_timestamp_ns,
         "unauthorized_decision_fill_count": 0,
-        "terminal_liquidation_fill_count": terminal_liquidation_count,
+        "target_transition_execution": transition_rows,
+        "position_ledger_reconciled": True,
+        "terminal_liquidation_fill_count": len(terminal_fills),
+        "terminal_liquidation_at": [str(fill["timestamp"]) for fill in terminal_fills],
+        "final_execution_at": pd.Timestamp(execution_frame.index[-1]).isoformat(),
         "terminal_liquidation_exempt": True,
     }
 
@@ -774,6 +1025,10 @@ def _validate_engine_artifacts(
         fills,
         theoretical_target_causality,
         cost_mode,
+        execution_frame,
+        targets,
+        positions,
+        equity,
     )
     if actual_execution_audit["signal_fill_count"] == 0:
         raise ValueError(f"{cost_mode} acceptance run produced no signal fill evidence")

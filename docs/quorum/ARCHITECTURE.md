@@ -644,11 +644,16 @@ evidence. Existing engine metrics, seeded bootstrap validation, artifacts, and
 run cards are reused unchanged; `artifacts/quorum_protocol.json` adds the split,
 expert, risk-stream, holdout, and theoretical target-causality declarations and
 is discovered by the normal run-card artifact scan. Acceptance separately audits
-immutable `fills.jsonl` evidence: every `signal` or `target_rebalance` fill must
-land on one of the declared next-bar execution timestamps. The engine's
-`end_of_backtest` liquidation is identified and exempted because it is terminal
-accounting rather than execution of a Quorum decision. A theoretical causal row
-alone cannot make the actual-execution control pass.
+immutable `fills.jsonl` evidence against the shifted `target_positions.csv`
+request stream and `positions.csv` execution truth. At every timestamp it
+classifies the exact requested transition (open, flip, close, resize, unchanged,
+or flat), verifies compatible `signal`/`target_rebalance` fills, and reconciles
+the cumulative signed-fill ledger to the persisted actual position. A fill moved
+to another otherwise-authorized bar therefore fails. The engine's
+`end_of_backtest` liquidation is exempt from Quorum decision attribution only
+when it occurs on the final execution-frame timestamp, uses a close fill, and
+closes the remaining position. A theoretical causal row alone cannot make the
+actual-execution control pass.
 
 The fixture does not require one fill for every changed target row. The existing
 rebalance engine can legitimately make no trade when lot rounding or the
