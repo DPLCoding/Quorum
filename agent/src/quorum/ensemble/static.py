@@ -263,6 +263,35 @@ class ExpertAttribution:
         return cls.from_dict(_json_mapping(text, "expert_attribution"))
 
 
+def _complete_decision_metrics(
+    attributions: tuple[ExpertAttribution, ...],
+) -> tuple[float, float]:
+    """Recompute the only valid score and disagreement for complete evidence."""
+    if not all(
+        item.present
+        and item.expert_score is not None
+        and item.weighted_contribution is not None
+        for item in attributions
+    ):
+        raise ValueError("complete decision metrics require complete attribution")
+
+    combined_score = _bounded_combined_score(
+        math.fsum(
+            item.weighted_contribution
+            for item in attributions
+            if item.weighted_contribution is not None
+        )
+    )
+    disagreement = math.sqrt(
+        math.fsum(
+            item.configured_weight * (item.expert_score - combined_score) ** 2
+            for item in attributions
+            if item.expert_score is not None
+        )
+    )
+    return combined_score, disagreement
+
+
 def _optional_key(value: str | None) -> tuple[bool, str]:
     return (value is not None, value or "")
 
@@ -330,28 +359,29 @@ class StaticEnsembleDecision:
                 raise ValueError(
                     "complete decision requires score, label, and disagreement"
                 )
-            object.__setattr__(
-                self,
+            combined_score = _finite_float(
                 "combined_score",
-                _finite_float(
-                    "combined_score",
-                    self.combined_score,
-                    minimum=-1.0,
-                    maximum=1.0,
-                ),
+                self.combined_score,
+                minimum=-1.0,
+                maximum=1.0,
             )
             if not isinstance(self.label, ReportingLabel):
                 raise TypeError("label must be a ReportingLabel")
-            object.__setattr__(
-                self,
+            disagreement = _finite_float(
                 "disagreement",
-                _finite_float(
-                    "disagreement",
-                    self.disagreement,
-                    minimum=0.0,
-                    maximum=2.0,
-                ),
+                self.disagreement,
+                minimum=0.0,
+                maximum=math.inf,
             )
+            expected_score, expected_disagreement = _complete_decision_metrics(
+                attributions
+            )
+            if combined_score != expected_score:
+                raise ValueError("combined_score does not match attribution")
+            if disagreement != expected_disagreement:
+                raise ValueError("disagreement does not match weighted dispersion")
+            object.__setattr__(self, "combined_score", combined_score)
+            object.__setattr__(self, "disagreement", disagreement)
         elif any(
             value is not None
             for value in (self.combined_score, self.label, self.disagreement)
@@ -412,59 +442,57 @@ class StaticEnsembleDecision:
             disagreement=self.disagreement,
         )
 
-    @classmethod
-    def from_dict(cls, data: object) -> "StaticEnsembleDecision":
-        payload = _require_payload(
-            data,
-            contract_name="static_ensemble_decision",
-            fields=frozenset(
-                {
-                    "asset",
-                    "event_at",
-                    "available_at",
-                    "decision_at",
-                    "horizon_bars",
-                    "experiment_id",
-                    "split_id",
-                    "attributions",
-                    "combined_score",
-                    "label",
-                    "disagreement",
-                }
-            ),
-        )
-        attribution_data = payload["attributions"]
-        if not isinstance(attribution_data, list):
-            raise TypeError("attributions must be a list")
-        label_data = payload["label"]
-        if label_data is not None and not isinstance(label_data, str):
-            raise TypeError("label must be a string or null")
-        try:
-            label = ReportingLabel(label_data) if label_data is not None else None
-        except ValueError as exc:
-            raise ValueError(f"unknown reporting label {label_data!r}") from exc
-        return cls(
-            asset=payload["asset"],
-            event_at=_parse_datetime("event_at", payload["event_at"]),
-            available_at=_parse_datetime("available_at", payload["available_at"]),
-            decision_at=_parse_datetime("decision_at", payload["decision_at"]),
-            horizon_bars=payload["horizon_bars"],
-            experiment_id=payload["experiment_id"],
-            split_id=payload["split_id"],
-            attributions=tuple(
-                ExpertAttribution.from_dict(item) for item in attribution_data
-            ),
-            combined_score=payload["combined_score"],
-            label=label,
-            disagreement=payload["disagreement"],
-        )
-
     def to_json(self) -> str:
+        """Serialize this embedded row; reconstruct through StaticEnsembleResult."""
         return _canonical_json(self.to_dict())
 
-    @classmethod
-    def from_json(cls, text: str) -> "StaticEnsembleDecision":
-        return cls.from_dict(_json_mapping(text, "static_ensemble_decision"))
+
+def _decision_from_dict(data: object) -> StaticEnsembleDecision:
+    """Parse an embedded row whose label is later validated by its result config."""
+    payload = _require_payload(
+        data,
+        contract_name="static_ensemble_decision",
+        fields=frozenset(
+            {
+                "asset",
+                "event_at",
+                "available_at",
+                "decision_at",
+                "horizon_bars",
+                "experiment_id",
+                "split_id",
+                "attributions",
+                "combined_score",
+                "label",
+                "disagreement",
+            }
+        ),
+    )
+    attribution_data = payload["attributions"]
+    if not isinstance(attribution_data, list):
+        raise TypeError("attributions must be a list")
+    label_data = payload["label"]
+    if label_data is not None and not isinstance(label_data, str):
+        raise TypeError("label must be a string or null")
+    try:
+        label = ReportingLabel(label_data) if label_data is not None else None
+    except ValueError as exc:
+        raise ValueError(f"unknown reporting label {label_data!r}") from exc
+    return StaticEnsembleDecision(
+        asset=payload["asset"],
+        event_at=_parse_datetime("event_at", payload["event_at"]),
+        available_at=_parse_datetime("available_at", payload["available_at"]),
+        decision_at=_parse_datetime("decision_at", payload["decision_at"]),
+        horizon_bars=payload["horizon_bars"],
+        experiment_id=payload["experiment_id"],
+        split_id=payload["split_id"],
+        attributions=tuple(
+            ExpertAttribution.from_dict(item) for item in attribution_data
+        ),
+        combined_score=payload["combined_score"],
+        label=label,
+        disagreement=payload["disagreement"],
+    )
 
 
 def _decision_sort_key(decision: StaticEnsembleDecision) -> tuple[Any, ...]:
@@ -478,9 +506,34 @@ def _decision_sort_key(decision: StaticEnsembleDecision) -> tuple[Any, ...]:
     )
 
 
+def _validate_decision_against_config(
+    decision: StaticEnsembleDecision, config: StaticEnsembleConfig
+) -> None:
+    expected_specs = tuple(
+        (item.expert_id, item.expert_version, item.weight) for item in config.experts
+    )
+    actual_specs = tuple(
+        (item.expert_id, item.expert_version, item.configured_weight)
+        for item in decision.attributions
+    )
+    if actual_specs != expected_specs:
+        raise ValueError("decision attributions do not match ensemble config")
+
+    if all(item.present for item in decision.attributions):
+        expected_score, expected_disagreement = _complete_decision_metrics(
+            decision.attributions
+        )
+        if decision.combined_score != expected_score:
+            raise ValueError("decision combined_score does not match attribution")
+        if decision.disagreement != expected_disagreement:
+            raise ValueError("decision disagreement does not match weighted dispersion")
+        if decision.label is not _reporting_label(expected_score, config):
+            raise ValueError("decision label does not match configured thresholds")
+
+
 @dataclass(frozen=True, slots=True)
 class StaticEnsembleResult:
-    """Immutable, canonically ordered decisions plus their frozen configuration."""
+    """Authoritative serialized decisions plus their validating configuration."""
 
     config: StaticEnsembleConfig
     decisions: tuple[StaticEnsembleDecision, ...] = ()
@@ -495,51 +548,8 @@ class StaticEnsembleResult:
         if len(keys) != len(set(keys)):
             raise ValueError("decisions contain duplicate alignment keys")
 
-        expected_specs = tuple(
-            (item.expert_id, item.expert_version, item.weight)
-            for item in self.config.experts
-        )
         for decision in decisions:
-            actual_specs = tuple(
-                (
-                    item.expert_id,
-                    item.expert_version,
-                    item.configured_weight,
-                )
-                for item in decision.attributions
-            )
-            if actual_specs != expected_specs:
-                raise ValueError("decision attributions do not match ensemble config")
-            if all(item.present for item in decision.attributions):
-                contributions = tuple(
-                    item.weighted_contribution for item in decision.attributions
-                )
-                if any(value is None for value in contributions):
-                    raise ValueError("complete attribution is missing a contribution")
-                raw_score = math.fsum(
-                    value for value in contributions if value is not None
-                )
-                expected_score = _bounded_combined_score(raw_score)
-                if decision.combined_score != expected_score:
-                    raise ValueError(
-                        "decision combined_score does not match attribution"
-                    )
-                if decision.label is not _reporting_label(expected_score, self.config):
-                    raise ValueError(
-                        "decision label does not match configured thresholds"
-                    )
-                expected_disagreement = math.sqrt(
-                    math.fsum(
-                        item.configured_weight
-                        * (item.expert_score - expected_score) ** 2
-                        for item in decision.attributions
-                        if item.expert_score is not None
-                    )
-                )
-                if decision.disagreement != expected_disagreement:
-                    raise ValueError(
-                        "decision disagreement does not match weighted dispersion"
-                    )
+            _validate_decision_against_config(decision, self.config)
 
         object.__setattr__(
             self, "decisions", tuple(sorted(decisions, key=_decision_sort_key))
@@ -565,11 +575,10 @@ class StaticEnsembleResult:
         decision_data = payload["decisions"]
         if not isinstance(decision_data, list):
             raise TypeError("decisions must be a list")
+        config = StaticEnsembleConfig.from_dict(config_data)
         return cls(
-            config=StaticEnsembleConfig.from_dict(config_data),
-            decisions=tuple(
-                StaticEnsembleDecision.from_dict(item) for item in decision_data
-            ),
+            config=config,
+            decisions=tuple(_decision_from_dict(item) for item in decision_data),
         )
 
     def to_json(self) -> str:
@@ -686,21 +695,8 @@ class StaticEnsemble:
             label: ReportingLabel | None = None
             disagreement: float | None = None
             if complete:
-                raw_score = math.fsum(
-                    item.weighted_contribution
-                    for item in attributions
-                    if item.weighted_contribution is not None
-                )
-                combined_score = _bounded_combined_score(raw_score)
+                combined_score, disagreement = _complete_decision_metrics(attributions)
                 label = _reporting_label(combined_score, self.config)
-                disagreement = math.sqrt(
-                    math.fsum(
-                        item.configured_weight
-                        * (item.expert_score - combined_score) ** 2
-                        for item in attributions
-                        if item.expert_score is not None
-                    )
-                )
 
             decisions.append(
                 StaticEnsembleDecision(

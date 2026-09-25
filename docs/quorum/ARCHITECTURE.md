@@ -568,6 +568,15 @@ configured-version mismatches fail closed. The ensemble reads no data or evaluat
 state and produces evidence only; conversion to constrained exposure belongs
 exclusively to the future Task 6 risk layer.
 
+`StaticEnsembleResult` is the authoritative serialized Task 5 artifact: its included
+configuration supplies the thresholds and expert specification needed to validate
+every embedded decision during reconstruction. Decision construction recomputes the
+combined score and disagreement from attribution rather than trusting supplied
+values, while result validation additionally derives the reporting label from the
+configured thresholds. Standalone decisions remain immutable public row values and
+may be serialized for embedding, but cannot be independently deserialized because a
+row alone cannot establish label correctness without its configuration.
+
 ### Portfolio and risk
 
 Base execution normalizes requested gross weight, enforces cash/margin/lot/market

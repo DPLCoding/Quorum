@@ -6,7 +6,7 @@ import ast
 import inspect
 import itertools
 import math
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -441,10 +441,47 @@ def test_result_serialization_round_trip_is_deterministic_and_instant_aware() ->
         ExpertAttribution.from_json(result.decisions[0].attributions[0].to_json())
         == result.decisions[0].attributions[0]
     )
-    assert (
-        StaticEnsembleDecision.from_json(result.decisions[0].to_json())
-        == result.decisions[0]
+
+
+def test_decision_rejects_false_combined_score_and_disagreement() -> None:
+    decision = _decision_for_scores((1.0, 1.0, 1.0))
+
+    with pytest.raises(ValueError, match="combined_score does not match attribution"):
+        replace(decision, combined_score=-1.0)
+    with pytest.raises(ValueError, match="disagreement does not match"):
+        replace(decision, disagreement=1.0)
+
+
+def test_standalone_decision_deserialization_is_not_a_public_trust_boundary() -> None:
+    decision = _decision_for_scores((1.0, 1.0, 1.0))
+    false_label_payload = decision.to_dict()
+    false_label_payload["label"] = ReportingLabel.SELL.value
+    false_label_json = decision.to_json().replace('"label":"BUY"', '"label":"SELL"')
+
+    assert decision.to_json()
+    assert '"label":"SELL"' in false_label_json
+    assert not hasattr(StaticEnsembleDecision, "from_dict")
+    assert not hasattr(StaticEnsembleDecision, "from_json")
+    with pytest.raises(AttributeError):
+        getattr(StaticEnsembleDecision, "from_dict")(false_label_payload)
+    with pytest.raises(AttributeError):
+        getattr(StaticEnsembleDecision, "from_json")(false_label_json)
+
+
+def test_result_rejects_false_label_during_construction_and_deserialization() -> None:
+    result = StaticEnsemble(_config()).combine(
+        ExpertResult(_complete_predictions((1.0, 1.0, 1.0)))
     )
+    decision = result.decisions[0]
+    false_label = replace(decision, label=ReportingLabel.SELL)
+
+    with pytest.raises(ValueError, match="label does not match configured thresholds"):
+        StaticEnsembleResult(result.config, (false_label,))
+
+    payload = result.to_dict()
+    payload["decisions"][0]["label"] = ReportingLabel.SELL.value
+    with pytest.raises(ValueError, match="label does not match configured thresholds"):
+        StaticEnsembleResult.from_dict(payload)
 
 
 def test_outputs_are_immutable_and_do_not_retain_caller_lists() -> None:
