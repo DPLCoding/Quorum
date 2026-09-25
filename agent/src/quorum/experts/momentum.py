@@ -4,11 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import ClassVar, cast
-
-from pandas import DataFrame
-
-from src.factors.zoo.qlib158.roc20 import compute as _compute_roc20
+from typing import ClassVar
 
 from src.quorum.contracts import ExpertResult, PredictionContext
 from src.quorum.experts.common import (
@@ -46,14 +42,10 @@ class MomentumExpert(metaclass=_ImmutableExpertMeta):
         if any(value is None for value in active):
             return ExpertResult(())
 
-        values = cast(tuple[float, ...], active)
-        close_frame = DataFrame({series.asset: values})
-        raw_return = float(_compute_roc20({"close": close_frame}).iloc[-1, 0])
-        # The shared factor's safe_div denominator guard creates a tiny residual
-        # for exactly equal endpoints. Preserve V0's exact neutral-return contract
-        # without introducing a tolerance band for genuinely nonzero returns.
-        if values[-1] == values[0]:
-            raw_return = 0.0
+        first = active[0]
+        last = active[-1]
+        assert first is not None and last is not None
+        raw_return = last / first - 1.0
         score = _clamp_score(raw_return / self.RETURN_SCALE)
         return _prediction_result(
             expert_id=self.expert_id,

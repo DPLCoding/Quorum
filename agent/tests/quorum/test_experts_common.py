@@ -493,8 +493,6 @@ def test_clamp_rejects_nonfinite_internal_scores() -> None:
 
 def test_expert_modules_have_only_allowed_dependencies() -> None:
     allowed_nonstdlib = {
-        "pandas",
-        "src.factors.zoo.qlib158.roc20",
         "src.quorum.contracts",
         "src.quorum.experts.common",
         "src.quorum.experts.mean_reversion",

@@ -4,11 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from pandas import DataFrame
 import pytest
 
-import src.quorum.experts.momentum as momentum_module
-from src.factors.zoo.qlib158.roc20 import compute as compute_roc20
 from src.quorum import MomentumExpert, PredictionContext
 
 UTC = timezone.utc
@@ -53,29 +50,24 @@ def test_momentum_exact_golden_formula_and_metadata() -> None:
     }
 
 
-def test_momentum_raw_signal_is_sourced_from_approved_roc20_factor(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("last", "expected_return", "expected_score"),
+    (
+        (1.1e-12, 0.10, 1.0),
+        (0.9e-12, -0.10, -1.0),
+    ),
+)
+def test_momentum_tiny_positive_prices_use_exact_ordinary_division(
+    last: float, expected_return: float, expected_score: float
 ) -> None:
-    assert momentum_module._compute_roc20 is compute_roc20
-    calls: list[dict[str, DataFrame]] = []
-
-    def approved_factor_result(panel: dict[str, DataFrame]) -> DataFrame:
-        calls.append(panel)
-        result = DataFrame(float("nan"), index=panel["close"].index, columns=["MOM"])
-        result.iloc[-1, 0] = 0.025
-        return result
-
-    monkeypatch.setattr(momentum_module, "_compute_roc20", approved_factor_result)
-    data, context = _case([100.0 + index for index in range(21)])
+    closes = [1.0e-12] * 20 + [last]
+    data, context = _case(closes)
 
     prediction = MomentumExpert().predict(data, context).predictions[0]
 
-    assert len(calls) == 1
-    assert tuple(calls[0]) == ("close",)
-    assert calls[0]["close"].shape == (21, 1)
-    assert calls[0]["close"].columns.tolist() == ["MOM"]
-    assert prediction.metadata["raw_return"] == 0.025
-    assert prediction.score == 0.25
+    assert prediction.metadata["raw_return"] == pytest.approx(expected_return)
+    assert prediction.score == pytest.approx(expected_score)
+    assert prediction.score * expected_score > 0.0
 
 
 def test_momentum_direction_neutrality_and_saturation() -> None:
