@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from pandas import DataFrame
 import pytest
 
+import src.quorum.experts.momentum as momentum_module
+from src.factors.zoo.qlib158.roc20 import compute as compute_roc20
 from src.quorum import MomentumExpert, PredictionContext
 
 UTC = timezone.utc
@@ -48,6 +51,31 @@ def test_momentum_exact_golden_formula_and_metadata() -> None:
         "return_scale": 0.10,
         "raw_return": pytest.approx(0.05),
     }
+
+
+def test_momentum_raw_signal_is_sourced_from_approved_roc20_factor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert momentum_module._compute_roc20 is compute_roc20
+    calls: list[dict[str, DataFrame]] = []
+
+    def approved_factor_result(panel: dict[str, DataFrame]) -> DataFrame:
+        calls.append(panel)
+        result = DataFrame(float("nan"), index=panel["close"].index, columns=["MOM"])
+        result.iloc[-1, 0] = 0.025
+        return result
+
+    monkeypatch.setattr(momentum_module, "_compute_roc20", approved_factor_result)
+    data, context = _case([100.0 + index for index in range(21)])
+
+    prediction = MomentumExpert().predict(data, context).predictions[0]
+
+    assert len(calls) == 1
+    assert tuple(calls[0]) == ("close",)
+    assert calls[0]["close"].shape == (21, 1)
+    assert calls[0]["close"].columns.tolist() == ["MOM"]
+    assert prediction.metadata["raw_return"] == 0.025
+    assert prediction.score == 0.25
 
 
 def test_momentum_direction_neutrality_and_saturation() -> None:

@@ -5,7 +5,6 @@ from __future__ import annotations
 import ast
 import inspect
 import math
-from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -35,6 +34,43 @@ EXPERT_CASES = (
         20,
         "quorum.mean_reversion",
         "quorum:mean-reversion:v0",
+    ),
+)
+
+FROZEN_SPEC_CASES = (
+    (
+        MomentumExpert,
+        21,
+        {
+            "expert_id": "quorum.momentum",
+            "expert_version": "v0.1.0",
+            "config_id": "quorum:momentum:v0",
+            "LOOKBACK": 20,
+            "RETURN_SCALE": 0.10,
+        },
+    ),
+    (
+        TrendExpert,
+        50,
+        {
+            "expert_id": "quorum.trend",
+            "expert_version": "v0.1.0",
+            "config_id": "quorum:trend:v0",
+            "FAST_WINDOW": 10,
+            "SLOW_WINDOW": 50,
+            "SPREAD_SCALE": 0.05,
+        },
+    ),
+    (
+        MeanReversionExpert,
+        20,
+        {
+            "expert_id": "quorum.mean_reversion",
+            "expert_version": "v0.1.0",
+            "config_id": "quorum:mean-reversion:v0",
+            "WINDOW": 20,
+            "ZSCORE_SCALE": 3.0,
+        },
     ),
 )
 
@@ -95,8 +131,51 @@ def test_expert_protocol_identity_and_frozen_constructor(
     assert expert.config_id == config_id  # type: ignore[attr-defined]
     with pytest.raises(TypeError):
         expert_type(window=7)
-    with pytest.raises((FrozenInstanceError, TypeError, AttributeError)):
+    with pytest.raises((AttributeError, TypeError)):
         expert.config_id = "changed"  # type: ignore[attr-defined,misc]
+
+
+@pytest.mark.parametrize(
+    ("expert_type", "kwargs"),
+    (
+        (MomentumExpert, {"window": 7}),
+        (TrendExpert, {"fast_window": 5}),
+        (MeanReversionExpert, {"window": 10}),
+    ),
+)
+def test_experts_expose_no_constructor_tuning_knobs(
+    expert_type: type[object], kwargs: dict[str, int]
+) -> None:
+    with pytest.raises(TypeError):
+        expert_type(**kwargs)
+
+
+@pytest.mark.parametrize(("expert_type", "minimum", "spec"), FROZEN_SPEC_CASES)
+def test_every_scientific_identity_and_parameter_rejects_runtime_mutation(
+    expert_type: type[object], minimum: int, spec: dict[str, object]
+) -> None:
+    data = _prepared([100.0 + index for index in range(minimum)])
+    context = _context(data)
+    baseline = expert_type().predict(data, context).to_json()  # type: ignore[attr-defined]
+
+    for name, expected in spec.items():
+        replacement: object = "changed" if isinstance(expected, str) else 999
+        assert getattr(expert_type, name) == expected
+        with pytest.raises(AttributeError, match="frozen V0 attribute"):
+            setattr(expert_type, name, replacement)
+        with pytest.raises(AttributeError, match="frozen V0 attribute"):
+            delattr(expert_type, name)
+
+        expert = expert_type()
+        with pytest.raises((AttributeError, TypeError)):
+            setattr(expert, name, replacement)
+        assert getattr(expert, name) == expected
+
+    with pytest.raises(AttributeError, match="frozen V0 attribute"):
+        expert_type._FROZEN_SCIENTIFIC_ATTRIBUTES = frozenset()  # type: ignore[attr-defined]
+    with pytest.raises(TypeError, match="cannot be subclassed"):
+        type(f"Changed{expert_type.__name__}", (expert_type,), {})
+    assert expert_type().predict(data, context).to_json() == baseline  # type: ignore[attr-defined]
 
 
 def test_experts_package_exports_only_three_public_experts() -> None:
@@ -414,6 +493,8 @@ def test_clamp_rejects_nonfinite_internal_scores() -> None:
 
 def test_expert_modules_have_only_allowed_dependencies() -> None:
     allowed_nonstdlib = {
+        "pandas",
+        "src.factors.zoo.qlib158.roc20",
         "src.quorum.contracts",
         "src.quorum.experts.common",
         "src.quorum.experts.mean_reversion",

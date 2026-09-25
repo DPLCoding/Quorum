@@ -10,6 +10,7 @@ from typing import ClassVar, cast
 
 from src.quorum.contracts import ExpertResult, PredictionContext
 from src.quorum.experts.common import (
+    _ImmutableExpertMeta,
     _clamp_score,
     _normalize_prepared_close_series,
     _prediction_result,
@@ -17,7 +18,7 @@ from src.quorum.experts.common import (
 
 
 @dataclass(frozen=True, slots=True)
-class MeanReversionExpert:
+class MeanReversionExpert(metaclass=_ImmutableExpertMeta):
     """Emit inverse evidence from the frozen 20-bar sample price z-score."""
 
     expert_id: ClassVar[str] = "quorum.mean_reversion"
@@ -25,6 +26,9 @@ class MeanReversionExpert:
     config_id: ClassVar[str] = "quorum:mean-reversion:v0"
     WINDOW: ClassVar[int] = 20
     ZSCORE_SCALE: ClassVar[float] = 3.0
+    _FROZEN_SCIENTIFIC_ATTRIBUTES = frozenset(
+        {"expert_id", "expert_version", "config_id", "WINDOW", "ZSCORE_SCALE"}
+    )
 
     def predict(
         self,

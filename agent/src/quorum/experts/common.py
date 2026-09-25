@@ -23,6 +23,33 @@ from src.quorum.contracts import (
 _PREPARED_FIELDS = frozenset({"asset", "close", "event_at", "available_at"})
 
 
+class _ImmutableExpertMeta(type):
+    """Prevent runtime changes to a V0 class's scientific identity or parameters."""
+
+    def __new__(
+        mcls: type,
+        name: str,
+        bases: tuple[type, ...],
+        namespace: dict[str, Any],
+        **kwargs: Any,
+    ) -> type:
+        if any(isinstance(base, _ImmutableExpertMeta) for base in bases):
+            raise TypeError("frozen V0 expert classes cannot be subclassed")
+        return super().__new__(mcls, name, bases, namespace, **kwargs)
+
+    def __setattr__(cls, name: str, value: object) -> None:
+        frozen = cls.__dict__.get("_FROZEN_SCIENTIFIC_ATTRIBUTES", frozenset())
+        if name == "_FROZEN_SCIENTIFIC_ATTRIBUTES" or name in frozen:
+            raise AttributeError(f"{cls.__name__}.{name} is a frozen V0 attribute")
+        super().__setattr__(name, value)
+
+    def __delattr__(cls, name: str) -> None:
+        frozen = cls.__dict__.get("_FROZEN_SCIENTIFIC_ATTRIBUTES", frozenset())
+        if name == "_FROZEN_SCIENTIFIC_ATTRIBUTES" or name in frozen:
+            raise AttributeError(f"{cls.__name__}.{name} is a frozen V0 attribute")
+        super().__delattr__(name)
+
+
 @dataclass(frozen=True, slots=True)
 class _PreparedCloseSeries:
     """Immutable normalized copy of one approved close-price history."""

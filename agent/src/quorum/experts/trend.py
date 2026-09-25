@@ -9,6 +9,7 @@ from typing import ClassVar, cast
 
 from src.quorum.contracts import ExpertResult, PredictionContext
 from src.quorum.experts.common import (
+    _ImmutableExpertMeta,
     _clamp_score,
     _normalize_prepared_close_series,
     _prediction_result,
@@ -16,7 +17,7 @@ from src.quorum.experts.common import (
 
 
 @dataclass(frozen=True, slots=True)
-class TrendExpert:
+class TrendExpert(metaclass=_ImmutableExpertMeta):
     """Emit evidence from the frozen SMA10-to-SMA50 relative spread."""
 
     expert_id: ClassVar[str] = "quorum.trend"
@@ -25,6 +26,16 @@ class TrendExpert:
     FAST_WINDOW: ClassVar[int] = 10
     SLOW_WINDOW: ClassVar[int] = 50
     SPREAD_SCALE: ClassVar[float] = 0.05
+    _FROZEN_SCIENTIFIC_ATTRIBUTES = frozenset(
+        {
+            "expert_id",
+            "expert_version",
+            "config_id",
+            "FAST_WINDOW",
+            "SLOW_WINDOW",
+            "SPREAD_SCALE",
+        }
+    )
 
     def predict(
         self,

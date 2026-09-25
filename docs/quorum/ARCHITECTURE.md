@@ -520,7 +520,10 @@ The V0 formulas and identities are frozen:
 
 - Momentum (`quorum.momentum`, `v0.1.0`, `quorum:momentum:v0`) uses the latest
   21 closes for the 20-bar simple return and emits
-  `clamp((close[t] / close[t-20] - 1) / 0.10, -1, 1)`.
+  `clamp((close[t] / close[t-20] - 1) / 0.10, -1, 1)`. Its raw return is
+  computed by directly invoking the existing `qlib158_roc20` factor on the
+  already-approved one-asset close slice; it does not use the registry or let the
+  factor fetch, select, or align data.
 - Trend (`quorum.trend`, `v0.1.0`, `quorum:trend:v0`) uses arithmetic SMA10 and
   SMA50 and emits `clamp((SMA10 / SMA50 - 1) / 0.05, -1, 1)`.
 - Mean Reversion (`quorum.mean_reversion`, `v0.1.0`,
@@ -536,6 +539,9 @@ probability or confidence claim. Every prediction copies the authoritative
 `event_at`, `available_at`, `decision_at`, horizon, and experiment/split references
 from its context; experts do not write the experiment ledger, ensemble evidence,
 size positions, or execute trades.
+Their public identities and formula parameters are class-readable but guarded
+against runtime reassignment or deletion, and instances have no mutable state or
+constructor tuning knobs.
 
 ### Portfolio and risk
 
