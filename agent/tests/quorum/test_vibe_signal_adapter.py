@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import inspect
 import math
+from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -168,6 +169,16 @@ def test_generate_emits_exact_series_with_leading_zero_and_target_persistence() 
     assert_frame_equal(data_map["A"], original)
 
 
+def test_single_risk_stream_is_inferred_and_inspectable() -> None:
+    risk_result = _risk_result((_row("A", 0.5, 1),))
+
+    adapter = VibeSignalAdapter(risk_result)
+
+    assert adapter.stream_key == ("exp-1", "split-1", 5)
+    with pytest.raises(FrozenInstanceError):
+        adapter.stream_key = ("exp-1", "other", 5)  # type: ignore[misc]
+
+
 def test_timezone_equivalent_event_instant_matches_existing_index_representation() -> (
     None
 ):
@@ -206,6 +217,114 @@ def test_timestamp_matching_is_independent_of_datetime_index_storage_unit() -> N
     assert signal.iloc[1] == pytest.approx(0.2)
 
 
+@pytest.mark.parametrize(
+    ("timezone_name", "wall_times", "event_at"),
+    (
+        (
+            "UTC",
+            ("2026-01-02 12:00", "2026-01-02 13:00", "2026-01-02 14:00"),
+            datetime(2026, 1, 2, 12, 0, tzinfo=UTC),
+        ),
+        (
+            "America/New_York",
+            ("2026-01-02 09:30", "2026-01-02 10:30", "2026-01-02 11:30"),
+            datetime(2026, 1, 2, 14, 30, tzinfo=UTC),
+        ),
+        (
+            "Asia/Shanghai",
+            ("2026-01-02 09:30", "2026-01-02 10:30", "2026-01-02 11:30"),
+            datetime(2026, 1, 2, 1, 30, tzinfo=UTC),
+        ),
+    ),
+)
+def test_naive_loader_indexes_use_explicit_market_timezone_interpretation(
+    timezone_name: str,
+    wall_times: tuple[str, ...],
+    event_at: datetime,
+) -> None:
+    index = pd.DatetimeIndex(wall_times)
+    row = (
+        "A",
+        0.5,
+        event_at,
+        event_at + timedelta(minutes=10),
+        "exp-1",
+        "split-1",
+        5,
+        True,
+    )
+    risk_result = _risk_result((row,))
+    declarations = {"A": timezone_name}
+    adapter = VibeSignalAdapter(risk_result, market_timezones=declarations)
+    declarations["A"] = "UTC" if timezone_name != "UTC" else "Asia/Shanghai"
+
+    signal = adapter.generate({"A": _frame(index)})["A"]
+
+    assert signal.index is index
+    assert signal.tolist() == [0.2, 0.2, 0.2]
+    assert adapter.market_timezones == {"A": timezone_name}
+    with pytest.raises(TypeError):
+        adapter.market_timezones["A"] = "UTC"  # type: ignore[index]
+
+
+def test_naive_market_timezone_declarations_fail_closed_when_missing_or_invalid() -> (
+    None
+):
+    naive_index = INDEX.tz_localize(None)
+    risk_result = _risk_result((_row("A", 0.5, 1),))
+
+    with pytest.raises(ValueError, match="naive market index requires explicit"):
+        VibeSignalAdapter(risk_result).generate({"A": _frame(naive_index)})
+    with pytest.raises(ValueError, match="unknown market timezone"):
+        VibeSignalAdapter(risk_result, market_timezones={"A": "Mars/Olympus"})
+
+
+@pytest.mark.parametrize(
+    ("wall_times", "event_at", "message"),
+    (
+        (
+            ("2026-11-01 01:30", "2026-11-01 02:30"),
+            datetime(2026, 11, 1, 5, 30, tzinfo=UTC),
+            "ambiguous local market time",
+        ),
+        (
+            ("2026-03-08 02:30", "2026-03-08 04:00"),
+            datetime(2026, 3, 8, 7, 30, tzinfo=UTC),
+            "nonexistent local market time",
+        ),
+    ),
+)
+def test_naive_new_york_dst_ambiguity_and_nonexistence_fail_closed(
+    wall_times: tuple[str, str], event_at: datetime, message: str
+) -> None:
+    row = (
+        "A",
+        0.5,
+        event_at,
+        event_at + timedelta(minutes=10),
+        "exp-1",
+        "split-1",
+        5,
+        True,
+    )
+    risk_result = _risk_result((row,))
+
+    with pytest.raises(ValueError, match=message):
+        VibeSignalAdapter(
+            risk_result,
+            market_timezones={"A": "America/New_York"},
+        ).generate({"A": _frame(pd.DatetimeIndex(wall_times))})
+
+
+def test_timezone_declaration_is_rejected_for_aware_market_index() -> None:
+    risk_result = _risk_result((_row("A", 0.5, 1),))
+
+    with pytest.raises(ValueError, match="aware market index.*redundant"):
+        VibeSignalAdapter(risk_result, market_timezones={"A": "UTC"}).generate(
+            {"A": _frame()}
+        )
+
+
 def test_missing_asset_and_duplicate_signal_slot_fail_closed() -> None:
     risk_result = _risk_result((_row("A", 0.5, 1),))
     with pytest.raises(ValueError, match="missing required risk assets"):
@@ -219,7 +338,7 @@ def test_missing_asset_and_duplicate_signal_slot_fail_closed() -> None:
                 -0.5,
                 1,
                 decision_at=INDEX[1].to_pydatetime() + timedelta(minutes=20),
-                experiment="exp-2",
+                experiment="exp-1",
                 split="split-1",
             ),
         )
@@ -235,6 +354,18 @@ def test_incomplete_risk_group_is_never_converted_to_zero_or_partial_signals() -
     assert incomplete.targets[0].final_target_weight is None
     with pytest.raises(ValueError, match="incomplete group"):
         VibeSignalAdapter(incomplete).generate({"A": _frame()})
+
+    mixed = _risk_result(
+        (
+            _row("A", 0.5, 1, split="split-1"),
+            _row("A", -0.5, 3, split="split-2", complete=False),
+        )
+    )
+    complete_stream = VibeSignalAdapter(mixed, stream_key=("exp-1", "split-1", 5))
+    incomplete_stream = VibeSignalAdapter(mixed, stream_key=("exp-1", "split-2", 5))
+    assert complete_stream.generate({"A": _frame()})["A"].iloc[1] == pytest.approx(0.2)
+    with pytest.raises(ValueError, match="incomplete group"):
+        incomplete_stream.generate({"A": _frame()})
 
 
 def test_event_calendar_and_next_bar_causality_failures() -> None:
@@ -268,12 +399,36 @@ def test_event_calendar_and_next_bar_causality_failures() -> None:
 def test_ambiguous_or_non_absolute_market_indexes_fail_closed() -> None:
     risk_result = _risk_result((_row("A", 0.5, 1),))
     duplicate_index = INDEX.insert(2, INDEX[1])
-    naive_index = INDEX.tz_localize(None)
 
     with pytest.raises(ValueError, match="unique increasing instants"):
         VibeSignalAdapter(risk_result).generate({"A": _frame(duplicate_index)})
-    with pytest.raises(ValueError, match="timezone-aware"):
-        VibeSignalAdapter(risk_result).generate({"A": _frame(naive_index)})
+
+
+def test_multiple_streams_require_selection_and_are_never_stitched() -> None:
+    risk_result = _risk_result(
+        (
+            _row("A", 1.0, 1, experiment="exp-1", split="split-1"),
+            _row("A", -1.0, 3, experiment="exp-1", split="split-2"),
+        )
+    )
+    split_1 = ("exp-1", "split-1", 5)
+    split_2 = ("exp-1", "split-2", 5)
+
+    with pytest.raises(ValueError, match="multiple streams"):
+        VibeSignalAdapter(risk_result)
+    with pytest.raises(ValueError, match="unknown risk stream"):
+        VibeSignalAdapter(risk_result, stream_key=("exp-1", "unknown", 5))
+
+    first = VibeSignalAdapter(risk_result, stream_key=split_1)
+    second = VibeSignalAdapter(risk_result, stream_key=split_2)
+    first_signal = first.generate({"A": _frame()})["A"]
+    second_signal = second.generate({"A": _frame()})["A"]
+
+    assert first.stream_key == split_1
+    assert second.stream_key == split_2
+    assert first_signal.tolist() == [0.0, 0.4, 0.4, 0.4, 0.4, 0.4]
+    assert second_signal.tolist() == [0.0, 0.0, 0.0, -0.4, -0.4, -0.4]
+    assert risk_result.rebalances[1].requested_turnover == pytest.approx(0.4)
 
 
 def test_v0_execution_config_validator_accepts_only_unmodified_rebalance_path() -> None:
@@ -323,6 +478,75 @@ def test_reporting_hold_is_not_vibe_hold_mode_or_a_flat_target() -> None:
     ] == pytest.approx(0.04)
     with pytest.raises(ValueError, match="position_adjustment"):
         validate_v0_vibe_config({"position_adjustment": "hold"})
+
+
+def test_cross_calendar_rebalance_with_one_execution_instant_passes() -> None:
+    decision_at = datetime(2026, 1, 2, 14, 30, tzinfo=UTC)
+    event_a = datetime(2026, 1, 2, 14, 0, tzinfo=UTC)
+    event_b = datetime(2026, 1, 2, 13, 30, tzinfo=UTC)
+    rows = (
+        ("A", 1.0, event_a, decision_at, "exp-1", "split-1", 5, True),
+        ("B", -1.0, event_b, decision_at, "exp-1", "split-1", 5, True),
+    )
+    risk_result = _risk_result(rows, gross=0.8, name=0.4)
+    index_a = pd.DatetimeIndex(
+        ["2026-01-02 14:00", "2026-01-02 15:00", "2026-01-02 16:00"],
+        tz="UTC",
+    )
+    index_b = pd.DatetimeIndex(
+        ["2026-01-02 13:30", "2026-01-02 15:00", "2026-01-02 16:30"],
+        tz="UTC",
+    )
+    data_map = {"A": _frame(index_a), "B": _frame(index_b)}
+
+    signals = VibeSignalAdapter(risk_result).generate(data_map)
+    _, _, _, target_positions, _ = _align(data_map, signals, ["A", "B"])
+
+    execution_instant = pd.Timestamp("2026-01-02 15:00", tz="UTC")
+    assert signals["A"].iloc[0] == pytest.approx(0.4)
+    assert signals["B"].iloc[0] == pytest.approx(-0.4)
+    assert target_positions.loc[execution_instant, "A"] == pytest.approx(0.4)
+    assert target_positions.loc[execution_instant, "B"] == pytest.approx(-0.4)
+    assert target_positions.loc[execution_instant].abs().sum() == pytest.approx(0.8)
+
+
+def test_equal_decision_cutoff_does_not_allow_asynchronous_execution() -> None:
+    decision_at = datetime(2026, 1, 2, 14, 30, tzinfo=UTC)
+    rows = (
+        (
+            "A",
+            1.0,
+            datetime(2026, 1, 2, 14, 0, tzinfo=UTC),
+            decision_at,
+            "exp-1",
+            "split-1",
+            5,
+            True,
+        ),
+        (
+            "B",
+            -1.0,
+            datetime(2026, 1, 2, 13, 30, tzinfo=UTC),
+            decision_at,
+            "exp-1",
+            "split-1",
+            5,
+            True,
+        ),
+    )
+    risk_result = _risk_result(rows, gross=0.8, name=0.4)
+    data_map = {
+        "A": _frame(
+            pd.DatetimeIndex(["2026-01-02 14:00", "2026-01-02 15:00"], tz="UTC")
+        ),
+        "B": _frame(
+            pd.DatetimeIndex(["2026-01-02 13:30", "2026-01-02 16:00"], tz="UTC")
+        ),
+    }
+
+    assert all(target.decision_at == decision_at for target in risk_result.targets)
+    with pytest.raises(ValueError, match="one coherent Vibe execution instant"):
+        VibeSignalAdapter(risk_result).generate(data_map)
 
 
 def test_base_align_preserves_policy_compliant_weights_and_shifts_on_own_calendar() -> (
@@ -431,9 +655,12 @@ def test_adapter_module_has_only_allowed_dependencies() -> None:
         "bisect",
         "collections",
         "dataclasses",
+        "datetime",
         "math",
         "numbers",
+        "types",
         "typing",
+        "zoneinfo",
     }
     assert all(
         dependency == "pandas"

@@ -599,15 +599,28 @@ These remain requested exposures: Vibe's unchanged `BaseEngine` still determines
 orders, fills, and actual positions under capital, lot, fee, and market rules.
 
 `VibeSignalAdapter` is the only Quorum core layer aware of pandas/Vibe signal shape.
-It emits final constrained targets on exact asset-calendar event rows, carries each
-approved target forward, and leaves earlier rows at zero. Because BaseEngine shifts
-each signal by one own-calendar bar, the adapter requires `decision_at` to be
-strictly earlier than that next bar and rejects missing, ambiguous, terminal, or
-duplicate slots. Incomplete risk results are never adapted. V0 execution requires
-`position_adjustment="rebalance"`, leverage one, no optimizer or constraints, no
-rebalance mask, and zero tolerance so downstream policy cannot rewrite or suppress
-Quorum targets. Reporting label `HOLD` remains unrelated to the engine's rejected
-legacy `"hold"` mode.
+One adapter instance executes exactly one risk stream. A sole stream is inferred;
+multiple `(experiment_id, split_id, horizon_bars)` streams require an explicit
+selector and are never stitched into one execution history. Task 7 may later
+orchestrate those independent OOF streams.
+
+Vibe loaders may provide timezone-naive market indexes while Quorum timestamps
+remain absolute and aware. Naive asset calendars therefore require an explicit IANA
+timezone declaration; the adapter interprets their wall times transiently with
+`zoneinfo`, rejects ambiguous or nonexistent DST times, and leaves the original
+DataFrame index unchanged. Aware indexes already define their instants and reject a
+redundant timezone declaration.
+
+The adapter validates each `RiskRebalance` before flattening its targets. Every
+`event_at` must match one asset-calendar row, `decision_at` must be strictly before
+that asset's next row, and all targets in the rebalance must resolve to the same next
+execution instant. Asynchronous portfolio transitions fail closed in V0 rather than
+creating an unaudited intermediate portfolio. Accepted final targets are written on
+their event rows, carried forward, and left at zero before the first target;
+incomplete selected-stream groups and duplicate slots are rejected. V0 execution
+requires `position_adjustment="rebalance"`, leverage one, no optimizer or
+constraints, no rebalance mask, and zero tolerance. Reporting label `HOLD` remains
+unrelated to the engine's rejected legacy `"hold"` mode.
 
 ### Portfolio and risk
 
