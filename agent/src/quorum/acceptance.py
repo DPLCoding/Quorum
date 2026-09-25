@@ -82,6 +82,8 @@ _COST_MODES: tuple[tuple[str, float], ...] = (
     ("cost-on", 0.002),
     ("cost-off", 0.0),
 )
+_DECISION_FILL_REASONS = frozenset({"signal", "target_rebalance"})
+_TERMINAL_FILL_REASON = "end_of_backtest"
 _REQUIRED_ARTIFACTS = frozenset(
     {
         "config.json",
@@ -507,7 +509,7 @@ def _serialize_signal(signal: pd.Series) -> list[dict[str, Any]]:
     ]
 
 
-def _causality_rows(
+def _theoretical_target_causality_rows(
     frame: pd.DataFrame,
     fold_science: _FoldScience,
 ) -> list[dict[str, Any]]:
@@ -581,7 +583,7 @@ def _protocol_sidecar(
     manifest: Mapping[str, Any],
     ensemble_config: StaticEnsembleConfig,
     risk_config: RiskPolicyConfig,
-    causality: list[dict[str, Any]],
+    theoretical_target_causality: list[dict[str, Any]],
     cost_mode: str,
     scientific_inputs_hash: str,
 ) -> dict[str, Any]:
@@ -614,7 +616,7 @@ def _protocol_sidecar(
             fold_science.split_id,
             HORIZON_BARS,
         ],
-        "causality": causality,
+        "theoretical_target_causality": theoretical_target_causality,
         "cost_mode": cost_mode,
         "scientific_inputs_hash": scientific_inputs_hash,
         "final_holdout_state": protocol.final_holdout.state.value,
@@ -645,6 +647,77 @@ def _read_fills(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _audit_actual_fill_execution(
+    fills: Sequence[Mapping[str, Any]],
+    theoretical_target_causality: Sequence[Mapping[str, Any]],
+    cost_mode: str,
+) -> dict[str, Any]:
+    """Fail closed unless every decision-driven fill uses an authorized bar.
+
+    ``end_of_backtest`` is deliberately excluded from Quorum decision-fill
+    causality: it is the engine's terminal accounting liquidation.  The V0
+    rebalance engine can use both ``signal`` (open/flip) and
+    ``target_rebalance`` (delta adjustment), so both reasons are audited.
+    """
+    authorized_by_ns: dict[int, str] = {}
+    for row in theoretical_target_causality:
+        if row.get("causal") is not True:
+            raise ValueError("theoretical target causality is not established")
+        timestamp = pd.Timestamp(row["execution_at"])
+        if timestamp.tzinfo is None:
+            raise ValueError("authorized execution timestamp must be timezone-aware")
+        authorized_by_ns[int(timestamp.value)] = timestamp.isoformat()
+    if not authorized_by_ns:
+        raise ValueError("actual fill audit has no authorized execution bars")
+
+    reason_counts = {reason: 0 for reason in sorted(_DECISION_FILL_REASONS)}
+    decision_fill_timestamps: list[str] = []
+    decision_fill_timestamp_ns: list[int] = []
+    terminal_liquidation_count = 0
+    for fill in fills:
+        reason = fill.get("reason")
+        if reason == _TERMINAL_FILL_REASON:
+            terminal_liquidation_count += 1
+            continue
+        if reason not in _DECISION_FILL_REASONS:
+            raise ValueError(
+                f"{cost_mode} contains unexpected non-terminal fill reason {reason!r}"
+            )
+        if fill.get("symbol") != ASSET:
+            raise ValueError(f"{cost_mode} decision fill has an unexpected asset")
+        timestamp = pd.Timestamp(fill.get("timestamp"))
+        if timestamp.tzinfo is None:
+            raise ValueError(
+                f"{cost_mode} decision fill timestamp must be timezone-aware"
+            )
+        timestamp_ns = int(timestamp.value)
+        if timestamp_ns not in authorized_by_ns:
+            raise ValueError(
+                f"{cost_mode} actual {reason} fill occurred at an unauthorized "
+                f"causal execution bar: {timestamp.isoformat()}"
+            )
+        reason_counts[str(reason)] += 1
+        decision_fill_timestamps.append(timestamp.isoformat())
+        decision_fill_timestamp_ns.append(timestamp_ns)
+
+    return {
+        "passed": True,
+        "authorized_execution_at": [
+            authorized_by_ns[key] for key in sorted(authorized_by_ns)
+        ],
+        "authorized_execution_count": len(authorized_by_ns),
+        "decision_fill_reasons": sorted(_DECISION_FILL_REASONS),
+        "decision_fill_count": len(decision_fill_timestamps),
+        "signal_fill_count": reason_counts["signal"],
+        "target_rebalance_fill_count": reason_counts["target_rebalance"],
+        "decision_fill_timestamps": decision_fill_timestamps,
+        "decision_fill_timestamp_ns": decision_fill_timestamp_ns,
+        "unauthorized_decision_fill_count": 0,
+        "terminal_liquidation_fill_count": terminal_liquidation_count,
+        "terminal_liquidation_exempt": True,
+    }
+
+
 def _stable_artifact_hashes(run_dir: Path, card: Mapping[str, Any]) -> dict[str, str]:
     artifacts = card.get("artifacts")
     if not isinstance(artifacts, list):
@@ -672,6 +745,7 @@ def _validate_engine_artifacts(
     execution_frame: pd.DataFrame,
     expected_shifted_targets: pd.Series,
     cost_mode: str,
+    theoretical_target_causality: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     for name in ("run_card.json", "run_card.md"):
         if not (run_dir / name).is_file():
@@ -696,6 +770,13 @@ def _validate_engine_artifacts(
     pd.read_csv(run_dir / "artifacts" / "trades.csv")
     pd.read_csv(run_dir / "artifacts" / "metrics.csv")
     fills = _read_fills(run_dir / "artifacts" / "fills.jsonl")
+    actual_execution_audit = _audit_actual_fill_execution(
+        fills,
+        theoretical_target_causality,
+        cost_mode,
+    )
+    if actual_execution_audit["signal_fill_count"] == 0:
+        raise ValueError(f"{cost_mode} acceptance run produced no signal fill evidence")
 
     observed_targets = tuple(float(value) for value in targets[ASSET])
     expected_targets = tuple(float(value) for value in expected_shifted_targets)
@@ -742,6 +823,7 @@ def _validate_engine_artifacts(
         "normalized_run_card": _normalized_run_card(card),
         "stable_artifact_hashes": hashes,
         "fills": fills,
+        "actual_execution_audit": actual_execution_audit,
         "fill_timestamp_ns": [
             int(pd.Timestamp(fill["timestamp"]).value) for fill in fills
         ],
@@ -785,7 +867,10 @@ def _execute_fold(
     signal = adapter.generate({ASSET: execution_frame})[ASSET]
     expected_shifted = signal.shift(1).fillna(0.0)
     serialized_signal = _serialize_signal(signal)
-    causality = _causality_rows(frame, fold_science)
+    theoretical_target_causality = _theoretical_target_causality_rows(
+        frame,
+        fold_science,
+    )
     scientific_inputs = {
         "expert_result": fold_science.expert_result.to_dict(),
         "ensemble_result": fold_science.ensemble_result.to_dict(),
@@ -811,7 +896,7 @@ def _execute_fold(
             manifest=fold.manifest.to_dict(),
             ensemble_config=ensemble_config,
             risk_config=risk_config,
-            causality=causality,
+            theoretical_target_causality=theoretical_target_causality,
             cost_mode=cost_mode,
             scientific_inputs_hash=scientific_inputs_hash,
         )
@@ -831,6 +916,7 @@ def _execute_fold(
             execution_frame,
             expected_shifted,
             cost_mode,
+            theoretical_target_causality,
         )
         mode_evidence["config"] = config
         mode_evidence["scientific_inputs_hash"] = scientific_inputs_hash
@@ -852,20 +938,6 @@ def _execute_fold(
     ):
         raise ValueError("cost-on terminal equity is spuriously better than cost-off")
 
-    first_execution_ns = int(execution_frame.index[1].value)
-    for cost_mode, _ in _COST_MODES:
-        if any(
-            timestamp_ns < first_execution_ns
-            for timestamp_ns in modes[cost_mode]["fill_timestamp_ns"]
-        ):
-            raise ValueError("BaseEngine filled before the first causal execution bar")
-    for row in causality:
-        execution_ns = int(pd.Timestamp(row["execution_at"]).value)
-        row["actual_fill_count_at_execution"] = {
-            cost_mode: modes[cost_mode]["fill_timestamp_ns"].count(execution_ns)
-            for cost_mode, _ in _COST_MODES
-        }
-
     return {
         "fold_index": fold_science.fold_index,
         "split_id": fold_science.split_id,
@@ -877,7 +949,7 @@ def _execute_fold(
         "risk_result": fold_science.risk_result.to_dict(),
         "vibe_targets": serialized_signal,
         "scientific_inputs_hash": scientific_inputs_hash,
-        "causality": causality,
+        "theoretical_target_causality": theoretical_target_causality,
         "runs": modes,
         "cost_effect": modes["cost-off"]["terminal_equity"]
         - modes["cost-on"]["terminal_equity"],
@@ -940,6 +1012,7 @@ def _scientific_fingerprint_payload(
                 "normalized_run_card": run["normalized_run_card"],
                 "stable_artifact_hashes": run["stable_artifact_hashes"],
                 "fills": run["fills"],
+                "actual_execution_audit": run["actual_execution_audit"],
                 "terminal_equity": run["terminal_equity"],
             }
         stable_folds.append(
@@ -950,7 +1023,7 @@ def _scientific_fingerprint_payload(
                 "execution_window_positions": fold["execution_window_positions"],
                 "risk_stream_key": fold["risk_stream_key"],
                 "scientific_inputs_hash": fold["scientific_inputs_hash"],
-                "causality": fold["causality"],
+                "theoretical_target_causality": fold["theoretical_target_causality"],
                 "runs": stable_runs,
             }
         )
@@ -1345,8 +1418,20 @@ def run_v0_acceptance(output_dir: Path) -> AcceptanceResult:
                 "final_holdout_locked": True,
                 "final_holdout_accessed": False,
                 "independent_fold_execution": True,
+                "theoretical_target_causality": all(
+                    row["causal"]
+                    for fold in fold_reports
+                    for row in fold["theoretical_target_causality"]
+                ),
+                "actual_fill_execution_authorized": all(
+                    run["actual_execution_audit"]["passed"]
+                    for fold in fold_reports
+                    for run in fold["runs"].values()
+                ),
                 "execution_after_availability": all(
-                    row["causal"] for fold in fold_reports for row in fold["causality"]
+                    run["actual_execution_audit"]["passed"]
+                    for fold in fold_reports
+                    for run in fold["runs"].values()
                 ),
                 "costs_applied": any(
                     fold["cost_effect"] > 1e-8 for fold in fold_reports

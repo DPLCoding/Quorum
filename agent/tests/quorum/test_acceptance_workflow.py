@@ -8,6 +8,7 @@ import json
 import socket
 import subprocess
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -139,7 +140,7 @@ def test_end_to_end_acceptance_proves_oof_execution_and_artifacts(
         assert fold["execution_window_positions"][1] < 140
         assert fold["cost_effect"] > 0.0
 
-        for row in fold["causality"]:
+        for row in fold["theoretical_target_causality"]:
             assert row["causal"] is True
             assert row["execution_position"] == row["event_position"] + 1
             assert (
@@ -147,10 +148,6 @@ def test_end_to_end_acceptance_proves_oof_execution_and_artifacts(
                 <= pd.Timestamp(row["decision_at"])
                 < pd.Timestamp(row["execution_at"])
             )
-            assert set(row["actual_fill_count_at_execution"]) == {
-                "cost-on",
-                "cost-off",
-            }
 
         cost_on = fold["runs"]["cost-on"]
         cost_off = fold["runs"]["cost-off"]
@@ -165,6 +162,17 @@ def test_end_to_end_acceptance_proves_oof_execution_and_artifacts(
 
         for mode, run in fold["runs"].items():
             total_fills += run["fill_count"]
+            actual_audit = run["actual_execution_audit"]
+            assert actual_audit["passed"] is True
+            assert actual_audit["authorized_execution_count"] == 10
+            assert actual_audit["decision_fill_count"] > 0
+            assert actual_audit["signal_fill_count"] > 0
+            assert actual_audit["unauthorized_decision_fill_count"] == 0
+            assert actual_audit["terminal_liquidation_fill_count"] == 1
+            assert actual_audit["terminal_liquidation_exempt"] is True
+            assert set(actual_audit["decision_fill_timestamps"]) <= set(
+                actual_audit["authorized_execution_at"]
+            )
             assert expected_artifacts <= set(run["stable_artifact_hashes"])
             assert (
                 run["stable_artifact_hashes"]["artifacts/positions.csv"]
@@ -185,6 +193,10 @@ def test_end_to_end_acceptance_proves_oof_execution_and_artifacts(
             assert sidecar["final_holdout_state"] == "locked"
             assert sidecar["final_holdout_accessed"] is False
             assert sidecar["cost_mode"] == mode
+            assert (
+                sidecar["theoretical_target_causality"]
+                == fold["theoretical_target_causality"]
+            )
             assert all(expert["fit_required"] is False for expert in sidecar["experts"])
             pd.read_csv(run_dir / "artifacts" / "equity.csv")
             pd.read_csv(run_dir / "artifacts" / "positions.csv")
@@ -199,6 +211,7 @@ def test_end_to_end_acceptance_proves_oof_execution_and_artifacts(
     assert report["cost_comparison"]["strict_cost_effect_fold_count"] == 5
     assert report["cost_comparison"]["total_terminal_equity_cost_effect"] > 0.0
     assert report["checks"] == {
+        "actual_fill_execution_authorized": True,
         "causal_prepared_data_prefixes": True,
         "chronological_boundaries_clean": True,
         "costs_applied": True,
@@ -209,7 +222,73 @@ def test_end_to_end_acceptance_proves_oof_execution_and_artifacts(
         "network_required": False,
         "requested_and_realized_exposure_separate": True,
         "test_predictions_are_oof": True,
+        "theoretical_target_causality": True,
     }
+
+
+def test_existing_vibe_run_consumer_reads_fold_artifacts(
+    completed_acceptance,
+) -> None:
+    import api_server
+
+    result, report = completed_acceptance
+    fold = report["folds"][0]
+    run_dir = result.output_dir / "folds" / "fold-000" / "cost-on"
+
+    assert not (run_dir / "state.json").exists()
+    response = api_server._build_response_from_run_dir(run_dir, elapsed=0.0)
+
+    assert response.status == "unknown"
+    assert response.metrics is not None
+    assert response.metrics.final_value == pytest.approx(
+        fold["runs"]["cost-on"]["terminal_equity"],
+        abs=1e-10,
+    )
+    assert response.equity_curve
+    assert response.trade_log
+    assert response.artifacts_positions_csv
+    assert response.artifacts_target_positions_csv
+    assert response.validation == fold["runs"]["cost-on"]["validation"]
+    assert response.run_card == _strict_json(run_dir / "run_card.json")
+
+
+def test_unauthorized_later_signal_fill_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    original_read_fills = acceptance._read_fills
+    moved_signal_fill = False
+
+    def read_fills_with_late_signal(path: Path):
+        nonlocal moved_signal_fill
+        fills = original_read_fills(path)
+        if moved_signal_fill:
+            return fills
+        for fill in fills:
+            if fill["reason"] == "signal":
+                fill["timestamp"] = (
+                    datetime.fromisoformat(fill["timestamp"]) + timedelta(days=30)
+                ).isoformat()
+                moved_signal_fill = True
+                break
+        return fills
+
+    monkeypatch.setattr(acceptance, "_read_fills", read_fills_with_late_signal)
+    output_dir = tmp_path / "unauthorized-fill"
+
+    with pytest.raises(
+        ValueError,
+        match="actual signal fill occurred at an unauthorized causal execution bar",
+    ):
+        acceptance.run_v0_acceptance(output_dir)
+
+    assert moved_signal_fill is True
+    assert (
+        ExperimentLedger(output_dir / "experiment_ledger.jsonl")
+        .get(acceptance.ATTEMPT_ID)
+        .state
+        is ExperimentState.FAILED
+    )
 
 
 def test_repeated_runs_have_identical_scientific_evidence(

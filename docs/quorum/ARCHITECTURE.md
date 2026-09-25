@@ -642,8 +642,27 @@ run once with frozen US slippage and once without it, proving the existing cost
 path while retaining requested targets, actual positions, and fills as distinct
 evidence. Existing engine metrics, seeded bootstrap validation, artifacts, and
 run cards are reused unchanged; `artifacts/quorum_protocol.json` adds the split,
-expert, risk-stream, holdout, and causality declarations and is discovered by the
-normal run-card artifact scan.
+expert, risk-stream, holdout, and theoretical target-causality declarations and
+is discovered by the normal run-card artifact scan. Acceptance separately audits
+immutable `fills.jsonl` evidence: every `signal` or `target_rebalance` fill must
+land on one of the declared next-bar execution timestamps. The engine's
+`end_of_backtest` liquidation is identified and exempted because it is terminal
+accounting rather than execution of a Quorum decision. A theoretical causal row
+alone cannot make the actual-execution control pass.
+
+The fixture does not require one fill for every changed target row. The existing
+rebalance engine can legitimately make no trade when lot rounding or the
+cost-dependent execution-price band leaves the requested size unchanged. The
+fail-closed invariant is therefore authorization of every actual decision fill,
+not a fabricated one-to-one target/fill correspondence.
+
+Task 7 fold directories are scientific subrun evidence nested beneath the
+authoritative acceptance run, not top-level Vibe jobs. They intentionally omit
+`state.json`, so the existing Vibe run consumer reports their status as
+`unknown` while still loading their metrics, equity, trades, actual and target
+positions, validation, and run card. The experiment ledger and top-level
+acceptance report remain the lifecycle authorities; duplicating a second subrun
+lifecycle would create conflicting status semantics.
 
 `quorum_acceptance.json` is the authoritative control report, accompanied by a
 human-readable Markdown report. Its canonical scientific fingerprint covers the
