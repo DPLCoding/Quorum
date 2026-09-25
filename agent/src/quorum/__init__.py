@@ -14,6 +14,13 @@ from src.quorum.contracts import (
     StaticEnsembleConfig,
     TimeInterval,
 )
+from src.quorum.ensemble import (
+    ExpertAttribution,
+    ReportingLabel,
+    StaticEnsemble,
+    StaticEnsembleDecision,
+    StaticEnsembleResult,
+)
 from src.quorum.experiments import (
     ExperimentAttempt,
     ExperimentEvent,
@@ -56,6 +63,7 @@ __all__ = [
     "ExperimentRecord",
     "ExperimentSpec",
     "ExperimentState",
+    "ExpertAttribution",
     "ExpertPrediction",
     "ExpertProtocol",
     "ExpertResult",
@@ -64,8 +72,12 @@ __all__ = [
     "FinalHoldout",
     "FinalHoldoutState",
     "PredictionContext",
+    "ReportingLabel",
     "SplitManifest",
+    "StaticEnsemble",
     "StaticEnsembleConfig",
+    "StaticEnsembleDecision",
+    "StaticEnsembleResult",
     "TimeInterval",
     "InvalidExperimentTransition",
     "InsufficientHistoryError",

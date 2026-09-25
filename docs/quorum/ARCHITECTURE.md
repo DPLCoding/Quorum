@@ -544,6 +544,30 @@ Their public identities and formula parameters are class-readable but guarded
 against runtime reassignment or deletion, and instances have no mutable state or
 constructor tuning knobs.
 
+#### Task 5 static ensemble
+
+Task 5 combines standardized predictions using an immutable, caller-supplied
+`StaticEnsembleConfig`; it defines no default weights or thresholds. Predictions
+align only when `asset`, event instant, decision instant, `horizon_bars`,
+`experiment_id`, and `split_id` match. For a complete row, the combined evidence is
+the numerically stable fixed sum `fsum(weight_i * score_i)`. The ensemble
+availability is the latest contributing availability instant, with canonical
+configuration order breaking equivalent-instant offset ties.
+
+Every decision retains one attribution entry per configured expert in canonical
+configuration order. If any configured expert is absent, the row explicitly has no
+combined score, reporting label, or disagreement; remaining weights are neither
+renormalized nor treated as zero evidence. Complete rows report weighted population
+dispersion `sqrt(fsum(weight_i * (score_i - combined_score) ** 2))` and descriptive
+threshold labels with `score <= sell` as `SELL`, `score >= buy` as `BUY`, and the
+interior as `HOLD`. These labels are not orders or position instructions.
+
+Grouping, timestamp selection, attribution, output ordering, and versioned JSON are
+deterministic and invariant to prediction input order. Unexpected expert IDs and
+configured-version mismatches fail closed. The ensemble reads no data or evaluation
+state and produces evidence only; conversion to constrained exposure belongs
+exclusively to the future Task 6 risk layer.
+
 ### Portfolio and risk
 
 Base execution normalizes requested gross weight, enforces cash/margin/lot/market
@@ -759,7 +783,7 @@ agent/
         trend.py
         mean_reversion.py
       ensemble/
-        static.py                       # NEW in V0
+        static.py                       # IMPLEMENTED in Task 5
       validation/
         protocol.py                     # NEW coordinator; wraps quantlib splits
       risk/
