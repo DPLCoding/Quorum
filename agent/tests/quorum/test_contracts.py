@@ -58,6 +58,7 @@ def test_package_exports_only_intended_quorum_contracts() -> None:
         "ExternalRecordRefs",
         "FinalHoldout",
         "FinalHoldoutState",
+        "FixedRiskPolicy",
         "InvalidExperimentTransition",
         "InsufficientHistoryError",
         "LeakageAudit",
@@ -68,6 +69,10 @@ def test_package_exports_only_intended_quorum_contracts() -> None:
         "OOFSlot",
         "PredictionContext",
         "ReportingLabel",
+        "RiskPolicyConfig",
+        "RiskPolicyResult",
+        "RiskRebalance",
+        "RiskTarget",
         "SplitManifest",
         "StaticEnsemble",
         "StaticEnsembleConfig",
@@ -77,6 +82,8 @@ def test_package_exports_only_intended_quorum_contracts() -> None:
         "materialize_chronological_plan",
         "require_clean_boundary",
         "TrendExpert",
+        "validate_v0_vibe_config",
+        "VibeSignalAdapter",
     }
 
 

@@ -577,6 +577,38 @@ configured thresholds. Standalone decisions remain immutable public row values a
 may be serialized for embedding, but cannot be independently deserialized because a
 row alone cannot establish label correctness without its configuration.
 
+#### Task 6 risk boundary and Vibe adapter
+
+Task 6 maps each complete continuous ensemble score to a proposed target with
+`score * max_abs_weight_per_asset`. Simultaneous decisions are grouped by decision
+instant within isolated `(experiment_id, split_id, horizon_bars)` streams. The pure
+risk policy proportionally scales the whole proposed vector when absolute gross
+exposure exceeds its zero-leverage cap, then proportionally interpolates from the
+stream's previous final target when requested L1 turnover exceeds its cap. It never
+optimizes, redistributes clipped exposure, or forces full investment. A stream's
+asset universe is fixed by its first group; changed membership or duplicate asset
+rows fail closed.
+
+If any asset has incomplete ensemble evidence, the entire portfolio group is marked
+non-executable, every target stage is `None`, and turnover state is not advanced.
+Immutable audit records keep ensemble score, proposed target, gross-constrained
+target, final requested target, both scale factors, requested turnover, and final
+gross distinct. `RiskPolicyResult` is the authoritative versioned serialization
+boundary and replays the policy against its included configuration when rebuilt.
+These remain requested exposures: Vibe's unchanged `BaseEngine` still determines
+orders, fills, and actual positions under capital, lot, fee, and market rules.
+
+`VibeSignalAdapter` is the only Quorum core layer aware of pandas/Vibe signal shape.
+It emits final constrained targets on exact asset-calendar event rows, carries each
+approved target forward, and leaves earlier rows at zero. Because BaseEngine shifts
+each signal by one own-calendar bar, the adapter requires `decision_at` to be
+strictly earlier than that next bar and rejects missing, ambiguous, terminal, or
+duplicate slots. Incomplete risk results are never adapted. V0 execution requires
+`position_adjustment="rebalance"`, leverage one, no optimizer or constraints, no
+rebalance mask, and zero tolerance so downstream policy cannot rewrite or suppress
+Quorum targets. Reporting label `HOLD` remains unrelated to the engine's rejected
+legacy `"hold"` mode.
+
 ### Portfolio and risk
 
 Base execution normalizes requested gross weight, enforces cash/margin/lot/market
@@ -796,9 +828,9 @@ agent/
       validation/
         protocol.py                     # NEW coordinator; wraps quantlib splits
       risk/
-        policy.py                       # NEW pure sizing/constraints
+        policy.py                       # IMPLEMENTED in Task 6: pure sizing/constraints
       adapters/
-        vibe_signal.py                  # NEW boundary to SignalEngine
+        vibe_signal.py                  # IMPLEMENTED in Task 6: SignalEngine boundary
     quantlib/crossvalidation.py         # EXISTING, REUSE; modify only for proven bug
     factors/                            # EXISTING, REUSE
     hypotheses/registry.py              # EXISTING, adapter/reference only

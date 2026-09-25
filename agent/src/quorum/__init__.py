@@ -1,5 +1,6 @@
 """Public deterministic scientific API for Quorum."""
 
+from src.quorum.adapters import VibeSignalAdapter, validate_v0_vibe_config
 from src.quorum.contracts import (
     EvaluationMode,
     EvaluationProtocol,
@@ -35,6 +36,13 @@ from src.quorum.experiments import (
     InvalidExperimentTransition,
 )
 from src.quorum.experts import MeanReversionExpert, MomentumExpert, TrendExpert
+from src.quorum.risk import (
+    FixedRiskPolicy,
+    RiskPolicyConfig,
+    RiskPolicyResult,
+    RiskRebalance,
+    RiskTarget,
+)
 from src.quorum.validation import (
     BoundaryLeakageError,
     ChronologicalEvaluationPlan,
@@ -71,8 +79,13 @@ __all__ = [
     "ExternalRecordRefs",
     "FinalHoldout",
     "FinalHoldoutState",
+    "FixedRiskPolicy",
     "PredictionContext",
     "ReportingLabel",
+    "RiskPolicyConfig",
+    "RiskPolicyResult",
+    "RiskRebalance",
+    "RiskTarget",
     "SplitManifest",
     "StaticEnsemble",
     "StaticEnsembleConfig",
@@ -90,4 +103,6 @@ __all__ = [
     "materialize_chronological_plan",
     "require_clean_boundary",
     "TrendExpert",
+    "validate_v0_vibe_config",
+    "VibeSignalAdapter",
 ]
