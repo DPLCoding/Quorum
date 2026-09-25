@@ -129,9 +129,9 @@ natural-language example in [`README.md`](../../README.md#L1160) is:
 vibe-trading run -p "Backtest a 20/50-day moving average crossover on AAPL for the past year, show Sharpe ratio and max drawdown"
 ```
 
-That workflow needs an LLM provider and may fetch market data. A deterministic
-Quorum acceptance workflow should eventually bypass both by using frozen local
-data and direct research/backtest APIs.
+That workflow needs an LLM provider and may fetch market data. The deterministic
+Quorum acceptance workflow bypasses both by using its frozen in-process fixture
+and direct research/backtest APIs.
 
 ### Environment boundary
 
@@ -601,8 +601,8 @@ orders, fills, and actual positions under capital, lot, fee, and market rules.
 `VibeSignalAdapter` is the only Quorum core layer aware of pandas/Vibe signal shape.
 One adapter instance executes exactly one risk stream. A sole stream is inferred;
 multiple `(experiment_id, split_id, horizon_bars)` streams require an explicit
-selector and are never stitched into one execution history. Task 7 may later
-orchestrate those independent OOF streams.
+selector and are never stitched into one execution history. Task 7 orchestrates
+those independent OOF streams as separate engine runs.
 
 Vibe loaders may provide timezone-naive market indexes while Quorum timestamps
 remain absolute and aware. Naive asset calendars therefore require an explicit IANA
@@ -621,6 +621,39 @@ incomplete selected-stream groups and duplicate slots are rejected. V0 execution
 requires `position_adjustment="rebalance"`, leverage one, no optimizer or
 constraints, no rebalance mask, and zero tolerance. Reporting label `HOLD` remains
 unrelated to the engine's rejected legacy `"hold"` mode.
+
+#### Task 7 offline acceptance workflow
+
+Task 7 exposes `run_v0_acceptance(output_dir)` and the thin
+`python -m src.quorum.acceptance --output-dir <path>` command. Its versioned,
+deterministic in-process OHLCV fixture requires no provider, configuration file,
+credentials, broker, LLM, or network. The real experiment ledger registers the
+attempt before evaluation and records `REGISTERED -> RUNNING -> COMPLETED` with
+fixed fixture lifecycle metadata. The real Task 3 plan remains authoritative:
+the final holdout stays locked, every validation/test assignment comes from its
+OOF slots, and the no-fit V0 experts receive only a prepared-data prefix ending
+at the assigned observation.
+
+Each fold's test predictions pass through the frozen experts, static ensemble,
+risk policy, and Vibe adapter, then execute in an independent
+`GlobalEquityEngine` run from the first test event through the one required next
+bar. Folds and their risk state are never stitched. The same requested targets
+run once with frozen US slippage and once without it, proving the existing cost
+path while retaining requested targets, actual positions, and fills as distinct
+evidence. Existing engine metrics, seeded bootstrap validation, artifacts, and
+run cards are reused unchanged; `artifacts/quorum_protocol.json` adds the split,
+expert, risk-stream, holdout, and causality declarations and is discovered by the
+normal run-card artifact scan.
+
+`quorum_acceptance.json` is the authoritative control report, accompanied by a
+human-readable Markdown report. Its canonical scientific fingerprint covers the
+fixture and dataset snapshot, experiment specification, protocol/manifests, OOF
+assignments and predictions, ensemble/risk results, cost configurations, stable
+metrics, execution evidence, artifact hashes, and normalized run-card content.
+Raw run-card bytes are not the identity because `generated_at` and `run_dir` are
+legitimate runtime fields; only those fields are removed from the normalized
+card. Acceptance `PASS` means the declared causal, reproducibility, artifact, and
+cost controls passed, not that the strategy is profitable or recommended.
 
 ### Portfolio and risk
 
