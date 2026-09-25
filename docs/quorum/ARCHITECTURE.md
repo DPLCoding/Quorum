@@ -679,6 +679,54 @@ legitimate runtime fields; only those fields are removed from the normalized
 card. Acceptance `PASS` means the declared causal, reproducibility, artifact, and
 cost controls passed, not that the strategy is profitable or recommended.
 
+#### Task 8 content-addressed market-bar snapshots
+
+Task 8 adds immutable scientific persistence for normalized market bars under
+`src.quorum.data`. It accepts already-loaded `MarketBar` records and deliberately
+does not fetch, discover, or fall back between providers. Each record carries an
+asset, a half-open `[start_at, event_at)` bar interval, an explicit
+`available_at`, and finite OHLCV values. All timestamps are aware, temporal
+ordering uses actual instants, and canonical row ordering is `(asset, event_at
+instant)`. No universal order is imposed between `event_at` and `available_at`;
+prediction consumers remain responsible for enforcing `available_at <=
+decision_at`.
+
+Identity has two explicit layers. `content_sha256` hashes canonical JSON covering
+the `quorum-market-bar-content-v1` namespace, schema version, dataset kind,
+interval declaration, timestamp convention, and every canonical market-bar row.
+Timestamp identity is normalized to UTC. `snapshot_id` separately hashes the
+`quorum-dataset-snapshot-v1` namespace, schema version, `content_sha256`, the same
+semantic declarations, derived asset/count summaries, and canonical
+`DatasetProvenance`. Consequently, identical scientific bars acquired under
+different source, revision, adjustment, retrieval, or metadata provenance share
+content identity but receive distinct complete-snapshot identities. Both external
+identities use `sha256:<64 lowercase hex>` and are always derived by the store.
+
+`DatasetSnapshotStore` publishes `<root>/sha256-<digest>/manifest.json` and
+`bars.jsonl`. Both files are compact, sorted-key UTF-8 JSON with a terminal
+newline; bar records are one JSON object per line. Creation writes and fsyncs a
+same-filesystem staging directory, then atomically renames the complete directory
+under a cross-process lock. Existing evidence is never overwritten, exact repeated
+creation is idempotent, and an interrupted staging directory is not a valid
+snapshot path.
+
+Every `load()` and `verify()` operation checks the requested ID, strict manifest
+and row schemas, canonical bytes and row order, row count, asset declaration,
+market-bar invariants, `content_sha256`, and recomputed `snapshot_id` before
+returning trusted objects. Missing, partial, noncanonical, corrupt, or tampered
+evidence fails closed; replay never invokes a provider. The resulting
+`snapshot_id` is used directly as `ExperimentSpec.data_snapshot_id`, while later
+coordination remains responsible for transforming verified bars into Task 3
+intervals and prediction inputs.
+
+This is intentionally distinct from the Vibe loader cache. The loader cache is a
+best-effort performance facility keyed by request/loading identity and may refetch
+on a miss or corrupt entry. A Quorum snapshot is append-only, content-addressed,
+self-verifying scientific evidence; a missing snapshot is an error. Task 8 adds no
+CSV/Parquet/DuckDB ingestion orchestration, provider integration, experiment
+runner, expert registry, fitting, portfolio logic, API/UI surface, or execution
+capability.
+
 ### Portfolio and risk
 
 Base execution normalizes requested gross weight, enforces cash/margin/lot/market

@@ -15,6 +15,16 @@ from src.quorum.contracts import (
     StaticEnsembleConfig,
     TimeInterval,
 )
+from src.quorum.data import (
+    DatasetProvenance,
+    DatasetSnapshot,
+    DatasetSnapshotError,
+    DatasetSnapshotIntegrityError,
+    DatasetSnapshotManifest,
+    DatasetSnapshotNotFoundError,
+    DatasetSnapshotStore,
+    MarketBar,
+)
 from src.quorum.ensemble import (
     ExpertAttribution,
     ReportingLabel,
@@ -60,6 +70,13 @@ __all__ = [
     "BoundaryLeakageError",
     "ChronologicalEvaluationPlan",
     "ChronologicalValidationError",
+    "DatasetProvenance",
+    "DatasetSnapshot",
+    "DatasetSnapshotError",
+    "DatasetSnapshotIntegrityError",
+    "DatasetSnapshotManifest",
+    "DatasetSnapshotNotFoundError",
+    "DatasetSnapshotStore",
     "EvaluationMode",
     "EvaluationProtocol",
     "ExperimentAttempt",
@@ -96,6 +113,7 @@ __all__ = [
     "InsufficientHistoryError",
     "LeakageAudit",
     "MaterializedFold",
+    "MarketBar",
     "MeanReversionExpert",
     "MomentumExpert",
     "OOFRole",
