@@ -2173,40 +2173,51 @@ class BaseEngine(ABC):
 
         Reductions consume every accumulated opening delta proportionally,
         matching the weighted-average entry accounting used by this engine.
-        Only the active position lifecycle matters; stopping at its preceding
-        full close avoids rescanning the entire fill ledger on every exit.
+        Only the active position lifecycle (fills since the symbol's last full
+        close) matters. Its lots are folded forward incrementally per symbol,
+        with proportional reductions kept as one running scale factor, so a
+        position rebalanced every bar but never fully closed costs amortized
+        O(1) per call instead of replaying and rescaling its whole lifecycle.
         """
-        active_fills: list[FillRecord] = []
-        for fill in reversed(self.fill_records):
+        fills = self.fill_records
+        # The ledger only appends; a replaced or shorter one is folded afresh.
+        if getattr(self, "_holding_ledger", None) is not fills or len(fills) < getattr(
+            self, "_holding_ledger_len", 0
+        ):
+            self._holding_ledger = fills
+            self._holding_lots: dict[str, list[float]] = {}
+        self._holding_ledger_len = len(fills)
+
+        # [next fill index, scale, sum(raw qty), sum(raw qty * bar)]; each lot's
+        # live quantity is raw * scale, so the weighted age is scale-free.
+        state = self._holding_lots.setdefault(position.symbol, [0, 1.0, 0.0, 0.0])
+        cursor, scale, raw_total, raw_bar_sum = state
+        for index in range(int(cursor), len(fills)):
+            fill = fills[index]
             if fill.symbol != position.symbol:
                 continue
-            if fill.action == "close":
-                break
-            active_fills.append(fill)
-
-        lots: list[list[float]] = []
-        for fill in reversed(active_fills):
             quantity = abs(fill.signed_quantity)
             if fill.action in {"open", "increase"}:
-                lots.append([quantity, float(fill.bar_idx)])
-                continue
-            if fill.action not in {"reduce", "close"}:
-                continue
-            total = sum(lot[0] for lot in lots)
-            if total <= 1e-12 or quantity >= total - 1e-12:
-                lots.clear()
-                continue
-            remaining_ratio = (total - quantity) / total
-            for lot in lots:
-                lot[0] *= remaining_ratio
+                raw = quantity / scale
+                raw_total += raw
+                raw_bar_sum += raw * int(fill.bar_idx)
+            elif fill.action == "close":
+                scale, raw_total, raw_bar_sum = 1.0, 0.0, 0.0
+            elif fill.action == "reduce":
+                total = raw_total * scale
+                if total <= 1e-12 or quantity >= total - 1e-12:
+                    scale, raw_total, raw_bar_sum = 1.0, 0.0, 0.0
+                else:
+                    scale *= (total - quantity) / total
+                    if scale < 1e-150:  # fold the scale in before it underflows
+                        raw_total *= scale
+                        raw_bar_sum *= scale
+                        scale = 1.0
+        state[:] = [len(fills), scale, raw_total, raw_bar_sum]
 
-        total = sum(lot[0] for lot in lots)
-        if total <= 1e-12:
+        if raw_total * scale <= 1e-12:
             return float(max(self._bar_idx - position.entry_bar_idx, 0))
-        return sum(
-            quantity * max(self._bar_idx - int(bar_idx), 0)
-            for quantity, bar_idx in lots
-        ) / total
+        return self._bar_idx - raw_bar_sum / raw_total
 
     # ── Artifacts ──
 
