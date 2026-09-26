@@ -739,6 +739,48 @@ CSV/Parquet/DuckDB ingestion orchestration, provider integration, experiment
 runner, expert registry, fitting, portfolio logic, API/UI surface, or execution
 capability.
 
+#### Task 9 real-data research runner and prediction evaluation
+
+`src.quorum.research` is the first path from real market data to out-of-fold
+evidence. `ingest` fetches daily bars once through a Vibe loader (yfinance by
+default) and publishes them as a Task 8 snapshot. Each trade-date row becomes a
+regular-session bar `[09:30, 16:00) America/New_York`, available at its close.
+Half-days are stamped 16:00, which only delays availability. Missing values fail
+closed; bars that had not closed at retrieval time are refused.
+
+`run` loads and verifies a snapshot and registers an `ExperimentAttempt` in the
+workspace ledger before any result exists. It then materializes an expanding
+locked-holdout plan: `horizon_bars` purge and embargo, with validation labels
+purged away from test. Every authorized validation and test slot is predicted by
+the frozen V0 experts on a trailing 60-bar window ending at that slot, and those
+predictions are combined by the equal-weight static ensemble. The target is
+tradable: it enters at the next bar's open (the engine's fill) and exits at the
+close `horizon_bars` bars after the decision bar. All assets must share one exact
+calendar; any difference fails closed because missing-asset and dynamic-universe
+semantics are not yet decided.
+
+`src.quorum.evaluation` scores predictions separately from P&L. For each role and
+predictor it reports:
+
+- coverage against authorized slots;
+- pooled Spearman IC;
+- per-fold IC mean, standard deviation, t-statistic, and positive fraction;
+- directional hit rate;
+- score spread and saturation at ±1;
+- pairwise score rank correlation and per-asset IC.
+
+Pooled IC makes no significance claim because forward horizons overlap within a
+fold. Reports, OOF prediction rows, and the ledger outcome live under
+`<workspace>/runs/<attempt_id>/`. The metrics fingerprint is identical across
+repeated attempts on the same snapshot and configuration, while every attempt
+still counts toward the trial family.
+
+Ingesting real data exposed an upstream defect: `validate_ohlc` dropped real
+trading days whose adjusted close sat one rounding error outside the high or low
+(about 1e-16 relative, from yfinance `auto_adjust`). Those excursions within
+1e-9 relative are now snapped back onto the high or low, and genuine violations
+are still dropped.
+
 ### Portfolio and risk
 
 Base execution normalizes requested gross weight, enforces cash/margin/lot/market
