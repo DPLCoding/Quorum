@@ -781,6 +781,24 @@ trading days whose adjusted close sat one rounding error outside the high or low
 1e-9 relative are now snapped back onto the high or low, and genuine violations
 are still dropped.
 
+#### Task 10 per-fold ridge stacker
+
+`src.quorum.stacking.RidgeStacker` is the first model with fitted parameters. It
+regresses the tradable forward return on the three standardized expert scores.
+The penalty `alpha * n` is declared as `ResearchConfig.stacker_alpha`, so it is
+never tuned on evaluation rows, and the intercept is unpenalized. Scores are
+`tanh` of the fitted deviation from the training-mean return, so zero means no
+view beyond drift, and the transform is monotone.
+
+The research runner refits the stacker for every fold on that fold's purged
+training positions, pooled across assets. It then predicts the fold's validation
+and test slots as predictor `stacker.ridge`. Each fold's model card records its
+coefficients and proves `train_label_end_max < evaluation_start`. Training on
+expert scores at training positions is valid only because the V0 experts have
+no fitted parameters; experts that learn must feed the stacker their
+out-of-fold rows instead. Expert scores are computed only for pre-holdout
+positions.
+
 ### Portfolio and risk
 
 Base execution normalizes requested gross weight, enforces cash/margin/lot/market

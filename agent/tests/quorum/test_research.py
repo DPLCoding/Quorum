@@ -132,6 +132,7 @@ def test_research_run_registers_first_keeps_holdout_locked_and_is_deterministic(
         "quorum.trend",
         "quorum.mean_reversion",
         "ensemble",
+        "stacker.ridge",
     }
     assert (pd.to_datetime(predictions["event_at"]) < holdout_start).all()
     assert (pd.to_datetime(predictions["label_end_at"]) < holdout_start).all()
@@ -143,6 +144,19 @@ def test_research_run_registers_first_keeps_holdout_locked_and_is_deterministic(
     test = report["evaluation"]["roles"]["test"]["predictors"]
     assert all(metrics["coverage"] == 1.0 for metrics in test.values())
     # Every registered attempt counts toward the trial family, in order.
+    # The stacker is refit per fold on rows whose labels resolved before that
+    # fold's first evaluation row, and every fold reports its model card.
+    stacker_folds = report["stacker"]["folds"]
+    assert len(stacker_folds) == report["chronology"]["fold_count"]
+    for fold in stacker_folds:
+        assert pd.Timestamp(fold["train_label_end_max"]) < pd.Timestamp(
+            fold["evaluation_start"]
+        )
+        assert set(fold["model"]["standardized_coef"]) == {
+            "quorum.momentum",
+            "quorum.trend",
+            "quorum.mean_reversion",
+        }
     later = json.loads(second.report_path.read_text(encoding="utf-8"))
     assert report["trial_family"]["attempt_count"] == 1
     assert later["trial_family"]["attempt_count"] == 2
@@ -169,7 +183,7 @@ def test_future_bars_cannot_change_earlier_predictions(tmp_path: Path) -> None:
         at = pd.to_datetime(frame["event_at"], utc=True)
         return frame[at <= last_visible].set_index(keys)["score"].sort_index()
 
-    assert len(early(base)) > 0
+    assert "stacker.ridge" in early(base).index.get_level_values("predictor")
     pd.testing.assert_series_equal(early(base), early(changed))
 
 
