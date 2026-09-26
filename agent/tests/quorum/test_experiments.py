@@ -952,3 +952,20 @@ def test_concurrent_state_transition_has_exactly_one_winner(tmp_path: Path) -> N
 
     assert sorted(outcomes) == ["conflict", "running"]
     assert len(ExperimentLedger(path).history(attempt.attempt_id)) == 2
+
+
+def test_contended_ledger_lock_times_out_with_explicit_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Neither silently failing nor hanging forever: a held lock yields a
+    # diagnosable timeout, and the lock is acquirable once released.
+    monkeypatch.setattr(experiment_module, "_LOCK_TIMEOUT_SECONDS", 0.2)
+    ledger_path = tmp_path / "ledger.jsonl"
+    with experiment_module._ledger_lock(ledger_path):
+        with pytest.raises(
+            experiment_module.ExperimentLedgerLockTimeout, match="ledger.jsonl.lock"
+        ):
+            with experiment_module._ledger_lock(ledger_path):
+                pass
+    with experiment_module._ledger_lock(ledger_path):
+        pass

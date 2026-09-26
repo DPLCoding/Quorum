@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from bisect import bisect_left
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from numbers import Real
@@ -165,13 +165,63 @@ def _canonical_timezones(
     return MappingProxyType(dict(sorted(normalized.items())))
 
 
+def _canonical_starts(
+    value: Mapping[str, Sequence[datetime]] | None,
+) -> Mapping[str, tuple[datetime, ...]]:
+    if value is None:
+        return MappingProxyType({})
+    if not isinstance(value, Mapping):
+        raise TypeError("bar_starts must be a mapping")
+    normalized: dict[str, tuple[datetime, ...]] = {}
+    for asset, starts in value.items():
+        asset = _required_text("bar start asset", asset)
+        if isinstance(starts, (str, bytes)) or not isinstance(starts, Sequence):
+            raise TypeError(f"bar starts for {asset!r} must be a sequence")
+        for start in starts:
+            if not isinstance(start, datetime):
+                raise TypeError(f"bar starts for {asset!r} must be datetimes")
+            if start.tzinfo is None or start.utcoffset() is None:
+                raise ValueError(f"bar starts for {asset!r} must be timezone-aware")
+        normalized[asset] = tuple(starts)
+    return MappingProxyType(dict(sorted(normalized.items())))
+
+
+def _open_instants(
+    asset: str, starts: Sequence[datetime], row_ends: Sequence[int]
+) -> tuple[int, ...]:
+    """Validate observed bar starts against the end-labelled market index."""
+    if len(starts) != len(row_ends):
+        raise ValueError(f"bar_starts for {asset!r} must hold one start per row")
+    opens = tuple(_timestamp_ns(start) for start in starts)
+    for position, (open_ns, end_ns) in enumerate(zip(opens, row_ends)):
+        if open_ns >= end_ns:
+            raise ValueError(
+                f"bar start for {asset!r} at row {position} must precede its row"
+            )
+        if position and open_ns < row_ends[position - 1]:
+            raise ValueError(
+                f"bar start for {asset!r} at row {position} overlaps the previous bar"
+            )
+    return opens
+
+
 @dataclass(frozen=True, slots=True)
 class VibeSignalAdapter:
-    """Expose one selected risk stream through Vibe's generate(data_map) shape."""
+    """Expose one selected risk stream through Vibe's generate(data_map) shape.
+
+    Index rows label bar ends, and the engine fills at the next row's open, so
+    ``decision_at`` must not be later than that open. Equality is accepted: a
+    decision at the close fills at a next open occurring at the same instant,
+    i.e. zero decision-to-order latency. ``bar_starts`` gives each asset's
+    observed bar start per index row, making the next open authoritative.
+    Without it the next bar may open at this row's close, so ``decision_at``
+    may not be later than ``event_at``.
+    """
 
     risk_result: RiskPolicyResult
     stream_key: RiskStreamKey | None = None
     market_timezones: Mapping[str, str] | None = None
+    bar_starts: Mapping[str, Sequence[datetime]] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.risk_result, RiskPolicyResult):
@@ -198,6 +248,7 @@ class VibeSignalAdapter:
         object.__setattr__(
             self, "market_timezones", _canonical_timezones(self.market_timezones)
         )
+        object.__setattr__(self, "bar_starts", _canonical_starts(self.bar_starts))
 
     def _selected_rebalances(self) -> tuple[RiskRebalance, ...]:
         return tuple(
@@ -233,6 +284,11 @@ class VibeSignalAdapter:
                 data_map[asset],
                 self.market_timezones.get(asset),
             )
+        open_instants = {
+            asset: _open_instants(asset, self.bar_starts[asset], index_instants[asset])
+            for asset in sorted(required_assets)
+            if asset in self.bar_starts
+        }
 
         for rebalance in rebalances:
             resolved_targets: list[tuple[str, int, float]] = []
@@ -255,10 +311,6 @@ class VibeSignalAdapter:
                         f"event_at for {target.asset!r} has no next executable bar"
                     )
                 execution_instant = instants[position + 1]
-                if _timestamp_ns(target.decision_at) >= execution_instant:
-                    raise ValueError(
-                        f"decision_at for {target.asset!r} is not before its next bar"
-                    )
                 slot = (target.asset, position)
                 if slot in seen_slots:
                     raise ValueError(
@@ -266,6 +318,19 @@ class VibeSignalAdapter:
                         f"for {target.asset!r}"
                     )
                 seen_slots.add(slot)
+                decision_instant = _timestamp_ns(target.decision_at)
+                opens = open_instants.get(target.asset)
+                if opens is None:
+                    if decision_instant > event_instant:
+                        raise ValueError(
+                            f"decision_at for {target.asset!r} is later than its "
+                            "bar close; the next bar may open at that instant"
+                        )
+                elif decision_instant > opens[position + 1]:
+                    raise ValueError(
+                        f"decision_at for {target.asset!r} is later than its "
+                        "next bar open"
+                    )
                 execution_instants.add(execution_instant)
                 resolved_targets.append((target.asset, position, final_weight))
 

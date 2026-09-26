@@ -19,9 +19,11 @@ backtest, agent, API, frontend, broker, expert, or ensemble implementations.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import re
+import time
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -792,6 +794,14 @@ class ExperimentLedgerCorruptionError(RuntimeError):
     """Raised when durable history cannot be trusted or reconstructed."""
 
 
+class ExperimentLedgerLockTimeout(TimeoutError):
+    """Raised when another process holds the ledger lock past the timeout."""
+
+
+_LOCK_TIMEOUT_SECONDS = 120.0
+_LOCK_POLL_SECONDS = 0.05
+
+
 @dataclass(frozen=True, slots=True)
 class _LedgerSnapshot:
     records: tuple[ExperimentHistoryRecord, ...]
@@ -801,16 +811,35 @@ class _LedgerSnapshot:
     event_ids: frozenset[str]
 
 
-def _lock_exclusive(handle: BinaryIO) -> None:
-    """Acquire the experiment ledger's cross-process transaction lock."""
+def _try_lock(handle: BinaryIO) -> bool:
+    """Attempt the exclusive lock once without blocking."""
     if fcntl is not None:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        return
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
     if msvcrt is not None:  # pragma: no cover - exercised on Windows
         handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-        return
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EDEADLOCK):
+                return False
+            raise
+        return True
     raise RuntimeError("no supported file-locking backend is available")
+
+
+def _lock_exclusive(handle: BinaryIO, lock_path: Path) -> None:
+    """Acquire the cross-process transaction lock or time out explicitly."""
+    deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+    while not _try_lock(handle):
+        if time.monotonic() >= deadline:
+            raise ExperimentLedgerLockTimeout(
+                f"timed out after {_LOCK_TIMEOUT_SECONDS}s waiting for {lock_path}"
+            )
+        time.sleep(_LOCK_POLL_SECONDS)
 
 
 def _unlock(handle: BinaryIO) -> None:
@@ -829,7 +858,7 @@ def _ledger_lock(path: Path) -> Iterator[None]:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock_path = path.with_suffix(path.suffix + ".lock")
     with open(lock_path, "a+b") as handle:
-        _lock_exclusive(handle)
+        _lock_exclusive(handle, lock_path)
         try:
             yield
         finally:
@@ -1171,6 +1200,7 @@ __all__ = [
     "ExperimentEvent",
     "ExperimentHistoryRecord",
     "ExperimentLedger",
+    "ExperimentLedgerLockTimeout",
     "ExperimentLedgerCorruptionError",
     "ExperimentOutcome",
     "ExperimentRecord",

@@ -62,7 +62,6 @@ BAR_COUNT = 160
 BAR_DURATION = timedelta(hours=1)
 HOLDOUT_BARS = 20
 HORIZON_BARS = 1
-DECISION_DELAY = timedelta(minutes=1)
 INITIAL_CASH = 100_000.0
 BARS_PER_YEAR = 252 * 6
 RANDOM_SEED = 1729
@@ -387,7 +386,8 @@ def _prediction_context(
     return PredictionContext(
         event_at=event_at,
         available_at=event_at,
-        decision_at=event_at + DECISION_DELAY,
+        # Decide at the bar close: bars touch, so the next open is this instant.
+        decision_at=event_at,
         horizon_bars=HORIZON_BARS,
         experiment_id=attempt_id,
         split_id=split_id,
@@ -511,6 +511,7 @@ def _serialize_signal(signal: pd.Series) -> list[dict[str, Any]]:
 
 def _theoretical_target_causality_rows(
     frame: pd.DataFrame,
+    bars: Sequence[TimeInterval],
     fold_science: _FoldScience,
 ) -> list[dict[str, Any]]:
     position_by_instant = {
@@ -525,7 +526,10 @@ def _theoretical_target_causality_rows(
             if execution_position >= len(frame):
                 raise ValueError("acceptance target has no next execution bar")
             execution_at = frame.index[execution_position].to_pydatetime()
-            if not target.available_at <= target.decision_at < execution_at:
+            # The engine fills at the execution bar's open: its observed start,
+            # not its end label.
+            execution_open_at = bars[execution_position].start
+            if not (target.available_at <= target.decision_at <= execution_open_at):
                 raise ValueError(
                     "acceptance target violates information-time causality"
                 )
@@ -537,6 +541,7 @@ def _theoretical_target_causality_rows(
                     "event_at": target.event_at.isoformat(),
                     "available_at": target.available_at.isoformat(),
                     "decision_at": target.decision_at.isoformat(),
+                    "execution_open_at": execution_open_at.isoformat(),
                     "execution_at": execution_at.isoformat(),
                     "final_target_weight": target.final_target_weight,
                     "causal": True,
@@ -1118,12 +1123,16 @@ def _execute_fold(
     adapter = VibeSignalAdapter(
         fold_science.risk_result,
         stream_key=stream_key,
+        bar_starts={
+            ASSET: [bar.start for bar in plan.bar_intervals[first_test : last_test + 2]]
+        },
     )
     signal = adapter.generate({ASSET: execution_frame})[ASSET]
     expected_shifted = signal.shift(1).fillna(0.0)
     serialized_signal = _serialize_signal(signal)
     theoretical_target_causality = _theoretical_target_causality_rows(
         frame,
+        plan.bar_intervals,
         fold_science,
     )
     scientific_inputs = {

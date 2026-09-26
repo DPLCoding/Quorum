@@ -101,12 +101,17 @@ checks are missing, failed, or non-evaluable.
 
 ### Quorum 0.7 — interpretable meta-models
 
-- First establish a regularized linear stacker over out-of-fold expert outputs and
+- Establish a regularized linear stacker over out-of-fold expert outputs and
   small causal state variables.
-- Add symbolic regression only with an allow-listed grammar, hard depth/node limits,
-  explicit complexity penalty, stability selection, and nested chronological
-  evaluation.
-- Never expose unrestricted raw market data to symbolic search by default.
+- Symbolic regression is deferred indefinitely as an experimental research track,
+  not part of the core. Over a handful of correlated expert scores it is unlikely
+  to beat a regularized linear stacker, and open-ended formula search makes the
+  trial count behind Deflated Sharpe ill-defined. Prefer adding the few candidate
+  interactions (for example trend × volatility regime) as explicit stacker
+  features. Revisit symbolic search only as a separately registered experiment
+  with a tiny grammar, a hard complexity limit, and every evaluated expression
+  counted as a trial, if the stacker leaves demonstrable out-of-fold structure
+  unexplained.
 
 Exit: every meta-model has a readable expression/model card, complexity accounting,
 and an honest simpler baseline.

@@ -413,7 +413,9 @@ The experiment spine makes scientific identity distinct from execution history:
   fsynced JSONL file. The existing standard-library-only governance ledger provides
   retained-chain tamper evidence and atomic append locking; a Quorum ledger-scoped
   lock covers the complete read/validate/append transaction for cooperating
-  processes and ledger instances. The application API only appends. Within the
+  processes and ledger instances. Waiting for that lock raises
+  `ExperimentLedgerLockTimeout` after 120 seconds on every platform rather than
+  failing silently or hanging. The application API only appends. Within the
   retained chain, modification, interior deletion/reordering/insertion, malformed
   records, partial writes, hash/sequence discontinuities, and chronologically
   inconsistent history fail closed. A clean rollback of complete trailing records
@@ -454,7 +456,11 @@ Training labels use closed endpoints: any historical row whose label ends at or
 after the first held-out validation position is additionally purged. The complete
 validation-plus-test block is then audited through
 `src.quantlib.crossvalidation.detect_boundary_leakage`; a dirty report raises and
-cannot become a `MaterializedFold`. Declared embargo positions are recorded
+cannot become a `MaterializedFold`. Validation is reserved for later fitting such
+as calibration, so it must not see test outcomes: validation ends at the first
+declared validation row whose label reaches the test block, and that row and the
+rest of the declared validation span are purged. A fold whose validation span is
+purged entirely fails closed. Declared embargo positions are recorded
 immediately after test wherever they exist before the final-holdout boundary; they
 are not future training rows for that fold.
 
@@ -612,9 +618,15 @@ DataFrame index unchanged. Aware indexes already define their instants and rejec
 redundant timezone declaration.
 
 The adapter validates each `RiskRebalance` before flattening its targets. Every
-`event_at` must match one asset-calendar row, `decision_at` must be strictly before
-that asset's next row, and all targets in the rebalance must resolve to the same next
-execution instant. Asynchronous portfolio transitions fail closed in V0 rather than
+`event_at` must match one asset-calendar row, and all targets in the rebalance must
+resolve to the same next execution row. Rows label bar ends and the engine fills
+at the next row's open, which is that bar's start, so `decision_at` must not be
+later than the next open. Equality is accepted and means zero decision-to-order
+latency: a decision at the close fills at a next open occurring at the same
+instant. The optional per-asset `bar_starts` supplies each row's observed bar
+start (for example `MarketBar.start_at` from a snapshot), which makes the next
+open authoritative rather than inferred. Without it, the next bar may open at
+this row's close, so `decision_at` may not be later than `event_at`. Asynchronous portfolio transitions fail closed in V0 rather than
 creating an unaudited intermediate portfolio. Accepted final targets are written on
 their event rows, carried forward, and left at zero before the first target;
 incomplete selected-stream groups and duplicate slots are rejected. V0 execution

@@ -48,7 +48,7 @@ def test_end_to_end_acceptance_proves_oof_execution_and_artifacts(
 
     assert result.status == report["status"] == "PASS"
     assert result.fold_count == report["chronology"]["fold_count"] == 5
-    assert result.validation_oof_slots == report["oof"]["validation_slot_count"] == 25
+    assert result.validation_oof_slots == report["oof"]["validation_slot_count"] == 20
     assert result.test_oof_slots == report["oof"]["test_slot_count"] == 50
     assert (
         result.scientific_fingerprint
@@ -71,13 +71,13 @@ def test_end_to_end_acceptance_proves_oof_execution_and_artifacts(
 
     assignments = report["oof"]["assignments"]
     positions = [assignment["sample_position"] for assignment in assignments]
-    assert len(positions) == len(set(positions)) == 75
+    assert len(positions) == len(set(positions)) == 70
     assert all(position < 140 for position in positions)
-    assert sum(row["role"] == "validation" for row in assignments) == 25
+    assert sum(row["role"] == "validation" for row in assignments) == 20
     assert sum(row["role"] == "test" for row in assignments) == 50
 
     audits = report["oof"]["prepared_input_audit"]
-    assert len(audits) == 75
+    assert len(audits) == 70
     assert all(row["prepared_end_position"] == row["sample_position"] for row in audits)
     assert all(
         row["prepared_row_count"] == row["sample_position"] + 1 for row in audits
@@ -92,10 +92,10 @@ def test_end_to_end_acceptance_proves_oof_execution_and_artifacts(
         "quorum.mean_reversion",
     }
     assert all(
-        count == {"validation": 25, "test": 50, "total": 75}
+        count == {"validation": 20, "test": 50, "total": 70}
         for count in counts.values()
     )
-    assert report["oof"]["prediction_count"] == 225
+    assert report["oof"]["prediction_count"] == 210
     assert report["oof"]["duplicate_prediction_count"] == 0
     assert report["oof"]["missing_test_prediction_count"] == 0
     ExpertResult.from_dict(report["oof"]["expert_result"])
@@ -143,9 +143,12 @@ def test_end_to_end_acceptance_proves_oof_execution_and_artifacts(
         for row in fold["theoretical_target_causality"]:
             assert row["causal"] is True
             assert row["execution_position"] == row["event_position"] + 1
+            # The engine fills at the execution bar's open, which is that
+            # bar's start, not the end label its fill is stamped with.
             assert (
                 pd.Timestamp(row["available_at"])
                 <= pd.Timestamp(row["decision_at"])
+                <= pd.Timestamp(row["execution_open_at"])
                 < pd.Timestamp(row["execution_at"])
             )
 

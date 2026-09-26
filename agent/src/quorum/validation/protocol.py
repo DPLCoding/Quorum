@@ -279,16 +279,22 @@ class MaterializedFold:
                 self.validation_positions[0] + len(self.validation_positions),
             )
         )
-        expected_test = tuple(
-            range(
-                self.validation_positions[-1] + 1,
-                self.validation_positions[-1] + 1 + len(self.test_positions),
-            )
-        )
+        test_start = self.test_positions[0]
+        expected_test = tuple(range(test_start, test_start + len(self.test_positions)))
         if self.validation_positions != expected_validation:
             raise ValueError("validation positions must be contiguous")
         if self.test_positions != expected_test:
-            raise ValueError("test positions must be contiguous and follow validation")
+            raise ValueError("test positions must be contiguous")
+        gap = tuple(range(self.validation_positions[-1] + 1, test_start))
+        if gap and (not set(gap) <= purge or label_ends[gap[0]] < test_start):
+            raise ValueError(
+                "only purged validation rows whose labels reach test may "
+                "separate validation from test"
+            )
+        if any(label_ends[p] >= test_start for p in self.validation_positions):
+            raise ChronologicalValidationError(
+                "validation labels must resolve before the test block"
+            )
 
         for position in self.validation_positions + self.test_positions:
             if label_ends[position] >= ordinary_stop:
@@ -689,12 +695,22 @@ def _derive_canonical_folds(
         last_evaluation + 1,
         protocol.step_bars,
     ):
-        validation = tuple(
-            range(evaluation_start, evaluation_start + protocol.validation_bars)
-        )
         test_start = evaluation_start + protocol.validation_bars
         test_end = test_start + protocol.test_bars
         test = tuple(range(test_start, test_end))
+        # Validation feeds later fitting (e.g. calibration), so it stops at the
+        # first row whose label reaches the test block; the rest is purged.
+        validation_block = tuple(range(evaluation_start, test_start))
+        cut = next(
+            (
+                index
+                for index, position in enumerate(validation_block)
+                if label_ends[position] >= test_start
+            ),
+            len(validation_block),
+        )
+        validation = validation_block[:cut]
+        validation_purge = validation_block[cut:]
         held_out = validation + test
         if any(label_ends[position] >= ordinary_stop for position in held_out):
             skipped_for_holdout_labels += 1
@@ -720,8 +736,13 @@ def _derive_canonical_folds(
         if len(train) < protocol.minimum_train_bars:
             skipped_for_history += 1
             continue
+        if not validation:
+            raise ChronologicalValidationError(
+                "validation_bars leave no validation rows whose labels resolve "
+                "before the test block"
+            )
 
-        purge = tuple(sorted((*explicit_purge, *label_purge)))
+        purge = tuple(sorted((*explicit_purge, *label_purge, *validation_purge)))
         embargo = tuple(
             range(
                 test_end,

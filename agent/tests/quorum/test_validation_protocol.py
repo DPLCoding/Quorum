@@ -255,7 +255,7 @@ def test_explicit_purge_is_absent_from_training_and_manifested() -> None:
 
 def test_forward_label_overlap_is_purged_and_quantlib_audit_is_clean() -> None:
     bars = _bars(40)
-    protocol = _protocol(bars, minimum_train_bars=4)
+    protocol = _protocol(bars, minimum_train_bars=4, validation_bars=4, step_bars=6)
     labels = tuple(
         min(position + 3, len(bars) - 1)
         for position in range(_ordinary_bar_count(bars, protocol))
@@ -298,6 +298,41 @@ def test_closed_endpoint_label_touching_evaluation_is_purged() -> None:
     assert labels[boundary - 1] == boundary
     assert boundary - 1 in first.purge_positions
     assert boundary - 1 not in first.train_positions
+
+
+def test_validation_labels_reaching_test_are_purged_before_test() -> None:
+    # Anything fitted on validation (e.g. calibration) must not see test outcomes.
+    bars = _bars(40)
+    protocol = _protocol(bars, minimum_train_bars=3, validation_bars=4, step_bars=6)
+    labels = tuple(
+        min(position + 2, len(bars) - 1)
+        for position in range(_ordinary_bar_count(bars, protocol))
+    )
+    plan = materialize_chronological_plan(
+        _attempt(protocol.protocol_id), protocol, bars, labels
+    )
+
+    for fold in plan.folds:
+        test_start = fold.test_positions[0]
+        assert fold.validation_positions == tuple(range(test_start - 4, test_start - 2))
+        assert {test_start - 2, test_start - 1} <= set(fold.purge_positions)
+        assert all(labels[p] < test_start for p in fold.validation_positions)
+    assert {slot.sample_position for slot in plan.validation_slots}.isdisjoint(
+        p for fold in plan.folds for p in fold.purge_positions
+    )
+
+
+def test_validation_fully_purged_by_label_horizon_fails_closed() -> None:
+    bars = _bars(40)
+    protocol = _protocol(bars, minimum_train_bars=3)
+    labels = tuple(
+        min(position + 2, len(bars) - 1)
+        for position in range(_ordinary_bar_count(bars, protocol))
+    )
+    with pytest.raises(ChronologicalValidationError, match="validation"):
+        materialize_chronological_plan(
+            _attempt(protocol.protocol_id), protocol, bars, labels
+        )
 
 
 def test_intentionally_dirty_split_is_rejected_not_warned() -> None:
@@ -432,7 +467,9 @@ def test_evaluation_labels_resolving_immediately_before_holdout_are_valid() -> N
     )
 
     last = plan.folds[-1]
-    assert last.validation_positions == (28, 29)
+    # Row 29's label reaches test, so it is purged out of validation.
+    assert last.validation_positions == (28,)
+    assert 29 in last.purge_positions
     assert last.test_positions == (30, 31)
     assert all(labels[position] < 32 for position in (28, 29, 30, 31))
 
@@ -1001,9 +1038,9 @@ def test_materialized_fold_invariants_across_protocol_combinations(
         mode=mode,
         minimum_train_bars=minimum,
         train_window_bars=window,
-        validation_bars=2,
+        validation_bars=4,
         test_bars=3,
-        step_bars=5,
+        step_bars=7,
         purge_bars=purge,
         embargo_bars=embargo,
         holdout_start_position=52,

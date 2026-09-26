@@ -33,6 +33,16 @@ NEW_YORK = ZoneInfo("America/New_York")
 INDEX = pd.date_range("2026-01-02T12:00:00Z", periods=6, freq="h")
 
 
+def _starts(
+    indexes: dict[str, pd.DatetimeIndex], duration: timedelta = timedelta(hours=1)
+) -> dict[str, tuple[datetime, ...]]:
+    """Observed starts for end-labelled bars of one fixed length."""
+    return {
+        asset: tuple((ts - duration).to_pydatetime() for ts in index)
+        for asset, index in indexes.items()
+    }
+
+
 def _frame(index: pd.DatetimeIndex = INDEX) -> pd.DataFrame:
     return pd.DataFrame(
         {
@@ -139,7 +149,7 @@ def _row(
         asset,
         score,
         event_at,
-        decision_at or event_at + timedelta(minutes=10),
+        decision_at or event_at,
         experiment,
         split,
         horizon,
@@ -189,7 +199,7 @@ def test_timezone_equivalent_event_instant_matches_existing_index_representation
                 "A",
                 1.0,
                 event_ny,
-                event_ny + timedelta(minutes=10),
+                event_ny,
                 "exp-1",
                 "split-1",
                 5,
@@ -247,7 +257,7 @@ def test_naive_loader_indexes_use_explicit_market_timezone_interpretation(
         "A",
         0.5,
         event_at,
-        event_at + timedelta(minutes=10),
+        event_at,
         "exp-1",
         "split-1",
         5,
@@ -392,8 +402,58 @@ def test_event_calendar_and_next_bar_causality_failures() -> None:
         VibeSignalAdapter(no_next).generate({"A": _frame()})
 
     late = _risk_result((_row("A", 0.5, 1, decision_at=INDEX[2].to_pydatetime()),))
-    with pytest.raises(ValueError, match="not before its next bar"):
+    with pytest.raises(ValueError, match="later than its bar close"):
         VibeSignalAdapter(late).generate({"A": _frame()})
+
+
+def test_decision_after_bar_close_is_rejected_because_next_open_may_precede_it() -> (
+    None
+):
+    # Bars are labelled by their end, so the next bar can open at this row's
+    # instant; the engine fills at that open, before a later decision.
+    event_at = INDEX[1].to_pydatetime()
+    after_close = _risk_result(
+        (_row("A", 0.5, 1, decision_at=event_at + timedelta(minutes=1)),)
+    )
+    with pytest.raises(ValueError, match="later than its bar close"):
+        VibeSignalAdapter(after_close).generate({"A": _frame()})
+
+    # Observed bar starts are authoritative: a gap before the next open admits a
+    # post-close decision, while a touching next bar rejects it.
+    gapped = VibeSignalAdapter(
+        after_close, bar_starts=_starts({"A": INDEX}, timedelta(minutes=30))
+    )
+    assert gapped.generate({"A": _frame()})["A"].iloc[1] == pytest.approx(0.2)
+    contiguous = VibeSignalAdapter(after_close, bar_starts=_starts({"A": INDEX}))
+    with pytest.raises(ValueError, match="later than its next bar open"):
+        contiguous.generate({"A": _frame()})
+
+    # A decision exactly at the next open is accepted (zero-latency fill).
+    at_open = _risk_result((_row("A", 0.5, 1, decision_at=event_at),))
+    assert VibeSignalAdapter(at_open, bar_starts=_starts({"A": INDEX})).generate(
+        {"A": _frame()}
+    )["A"].iloc[1] == pytest.approx(0.2)
+
+
+@pytest.mark.parametrize(
+    ("starts", "message"),
+    [
+        (lambda s: s[:-1], "one start per row"),
+        (lambda s: (s[0], INDEX[1].to_pydatetime(), *s[2:]), "precede its row"),
+        (
+            lambda s: (s[0], INDEX[0].to_pydatetime() - timedelta(minutes=1), *s[2:]),
+            "overlaps the previous bar",
+        ),
+        (lambda s: (s[0].replace(tzinfo=None), *s[1:]), "timezone-aware"),
+    ],
+)
+def test_declared_bar_starts_must_describe_the_market_index(
+    starts: object, message: str
+) -> None:
+    risk_result = _risk_result((_row("A", 0.5, 1),))
+    bad = {"A": starts(_starts({"A": INDEX})["A"])}  # type: ignore[operator]
+    with pytest.raises((TypeError, ValueError), match=message):
+        VibeSignalAdapter(risk_result, bar_starts=bad).generate({"A": _frame()})
 
 
 def test_ambiguous_or_non_absolute_market_indexes_fail_closed() -> None:
@@ -481,7 +541,7 @@ def test_reporting_hold_is_not_vibe_hold_mode_or_a_flat_target() -> None:
 
 
 def test_cross_calendar_rebalance_with_one_execution_instant_passes() -> None:
-    decision_at = datetime(2026, 1, 2, 14, 30, tzinfo=UTC)
+    decision_at = datetime(2026, 1, 2, 14, 0, tzinfo=UTC)
     event_a = datetime(2026, 1, 2, 14, 0, tzinfo=UTC)
     event_b = datetime(2026, 1, 2, 13, 30, tzinfo=UTC)
     rows = (
@@ -499,7 +559,9 @@ def test_cross_calendar_rebalance_with_one_execution_instant_passes() -> None:
     )
     data_map = {"A": _frame(index_a), "B": _frame(index_b)}
 
-    signals = VibeSignalAdapter(risk_result).generate(data_map)
+    signals = VibeSignalAdapter(
+        risk_result, bar_starts=_starts({k: v.index for k, v in data_map.items()})
+    ).generate(data_map)
     _, _, _, target_positions, _ = _align(data_map, signals, ["A", "B"])
 
     execution_instant = pd.Timestamp("2026-01-02 15:00", tz="UTC")
@@ -511,7 +573,7 @@ def test_cross_calendar_rebalance_with_one_execution_instant_passes() -> None:
 
 
 def test_equal_decision_cutoff_does_not_allow_asynchronous_execution() -> None:
-    decision_at = datetime(2026, 1, 2, 14, 30, tzinfo=UTC)
+    decision_at = datetime(2026, 1, 2, 14, 0, tzinfo=UTC)
     rows = (
         (
             "A",
@@ -546,7 +608,9 @@ def test_equal_decision_cutoff_does_not_allow_asynchronous_execution() -> None:
 
     assert all(target.decision_at == decision_at for target in risk_result.targets)
     with pytest.raises(ValueError, match="one coherent Vibe execution instant"):
-        VibeSignalAdapter(risk_result).generate(data_map)
+        VibeSignalAdapter(
+            risk_result, bar_starts=_starts({k: v.index for k, v in data_map.items()})
+        ).generate(data_map)
 
 
 def test_base_align_preserves_policy_compliant_weights_and_shifts_on_own_calendar() -> (

@@ -53,6 +53,7 @@ def test_package_exports_only_intended_quorum_contracts() -> None:
         "ExperimentHistoryRecord",
         "ExperimentLedger",
         "ExperimentLedgerCorruptionError",
+        "ExperimentLedgerLockTimeout",
         "ExperimentOutcome",
         "ExperimentRecord",
         "ExperimentSpec",

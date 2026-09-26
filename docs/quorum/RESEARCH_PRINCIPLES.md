@@ -5,7 +5,7 @@ Status: proposed project invariants from the Phase 0 audit (2026-09-23).
 Quorum is a research system first. Its primary output is defensible evidence about
 whether a signal survives out of sample, not a profitable-looking equity curve.
 These rules apply to deterministic experts, machine-learning experts, ensembles,
-and any future symbolic-regression layer.
+and any future meta-model.
 
 ## 1. Time and information
 
