@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -55,7 +56,7 @@ from src.quorum.data import (
     MarketBar,
 )
 from src.quorum.ensemble import StaticEnsemble
-from src.quorum.evaluation import evaluate_predictions
+from src.quorum.evaluation import evaluate_predictions, paired_fold_delta
 from src.quorum.experiments import (
     ExperimentLedger,
     ExperimentOutcome,
@@ -63,7 +64,17 @@ from src.quorum.experiments import (
     ExperimentState,
     ExternalRecordRefs,
 )
-from src.quorum.experts import MeanReversionExpert, MomentumExpert, TrendExpert
+from src.quorum.experts import (
+    AbnormalVolumeExpert,
+    MeanReversionExpert,
+    MomentumExpert,
+    OvernightMomentumExpert,
+    RangeReversalExpert,
+    TrendExpert,
+    VolatilityRegimeExpert,
+)
+from src.quorum.portfolio import run_oos_portfolios
+from src.quorum.risk import RiskPolicyConfig
 from src.quorum.stacking import RidgeStacker
 from src.quorum.validation import materialize_chronological_plan
 
@@ -74,10 +85,32 @@ REGULAR_CLOSE = time(16, 0)
 TIMESTAMP_CONVENTION = "bar:[regular-open,regular-close):America/New_York:v1"
 ENSEMBLE_PREDICTOR = "ensemble"
 STACKER_PREDICTOR = "stacker.ridge"
+PORTFOLIO_CONSTRUCTIONS = ("long_short", "long_only_tilt")
+_FAMILY_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 TRIAL_FAMILY_ID = "quorum:research:v0-experts"
 # Longest V0 lookback is SMA50; a trailing window keeps prediction O(n).
-_EXPERT_WINDOW_BARS = 60
-_EXPERTS = (MomentumExpert(), TrendExpert(), MeanReversionExpert())
+_V0_EXPERTS = (MomentumExpert(), TrendExpert(), MeanReversionExpert())
+# docs/quorum/EXPERTS_V1.md: frozen before any v1 result was observed.
+_V1_EXPERTS = (
+    VolatilityRegimeExpert(),
+    OvernightMomentumExpert(),
+    AbnormalVolumeExpert(),
+    RangeReversalExpert(),
+)
+# Trailing bars each expert needs, and whether it reads full OHLCV bars.
+_EXPERT_INPUTS = {
+    "quorum.momentum": (21, False),
+    "quorum.trend": (50, False),
+    "quorum.mean_reversion": (20, False),
+    "quorum.volatility_regime": (253, True),
+    "quorum.overnight_momentum": (21, True),
+    "quorum.abnormal_volume": (65, True),
+    "quorum.range_reversal": (5, True),
+}
+EXPERT_SETS = ("v0", "v1")
+INCREMENTAL_CRITERIA = {"orthogonal_max_abs_corr": 0.5, "incremental_min_t": 2.5}
+_REGIME_VOL_BARS = 20
+_REGIME_MEDIAN_BARS = 252
 
 
 class _Loader(Protocol):
@@ -181,8 +214,25 @@ class ResearchConfig:
     sell_threshold: float = -0.2
     buy_threshold: float = 0.2
     stacker_alpha: float = 0.1
+    max_gross_exposure: float = 1.0
+    max_weight_per_asset: float = 0.25
+    max_turnover: float = 0.5
+    portfolio_construction: str = "long_short"
+    rebalance_every_bars: int = 1
+    stacker_window_bars: int | None = None
+    expert_set: str = "v0"
 
     def __post_init__(self) -> None:
+        if self.expert_set not in EXPERT_SETS:
+            raise ValueError(f"expert_set must be one of {EXPERT_SETS}")
+        if self.portfolio_construction not in PORTFOLIO_CONSTRUCTIONS:
+            raise ValueError(
+                f"portfolio_construction must be one of {PORTFOLIO_CONSTRUCTIONS}"
+            )
+        if self.rebalance_every_bars < 1:
+            raise ValueError("rebalance_every_bars must be positive")
+        if self.stacker_window_bars is not None and self.stacker_window_bars < 20:
+            raise ValueError("stacker_window_bars must be None or at least 20")
         if self.validation_bars <= self.horizon_bars:
             raise ValueError("validation_bars must exceed horizon_bars")
         if self.holdout_bars <= self.horizon_bars:
@@ -265,45 +315,91 @@ def _protocol(config: ResearchConfig, bars: Sequence[MarketBar]) -> EvaluationPr
     )
 
 
-def _ensemble_config(config: ResearchConfig) -> StaticEnsembleConfig:
-    weight = 1.0 / len(_EXPERTS)
-    return StaticEnsembleConfig(
-        experts=tuple(
-            ExpertWeight(e.expert_id, e.expert_version, weight) for e in _EXPERTS
-        ),
-        sell_threshold=config.sell_threshold,
-        buy_threshold=config.buy_threshold,
-    )
+def _experts(config: ResearchConfig) -> tuple[Any, ...]:
+    return _V0_EXPERTS + (_V1_EXPERTS if config.expert_set == "v1" else ())
+
+
+def _ensembles(config: ResearchConfig) -> dict[str, StaticEnsemble]:
+    """Equal-weight static ensembles: the V0 three, plus all experts for v1."""
+    members = {ENSEMBLE_PREDICTOR: _V0_EXPERTS}
+    if config.expert_set == "v1":
+        members["ensemble.all"] = _experts(config)
+    return {
+        name: StaticEnsemble(
+            StaticEnsembleConfig(
+                experts=tuple(
+                    ExpertWeight(e.expert_id, e.expert_version, 1.0 / len(experts))
+                    for e in experts
+                ),
+                sell_threshold=config.sell_threshold,
+                buy_threshold=config.buy_threshold,
+            )
+        )
+        for name, experts in members.items()
+    }
+
+
+def _stacker_features(config: ResearchConfig) -> dict[str, tuple[str, ...]]:
+    """Feature sets: V0 alone, V0 plus each v1 expert, and every expert."""
+    v0 = tuple(e.expert_id for e in _V0_EXPERTS)
+    stackers = {STACKER_PREDICTOR: v0}
+    if config.expert_set == "v1":
+        for expert in _V1_EXPERTS:
+            stackers[f"stacker.v0+{expert.expert_id}"] = v0 + (expert.expert_id,)
+        stackers["stacker.all"] = tuple(e.expert_id for e in _experts(config))
+    return stackers
 
 
 def _predict(
     asset: str,
     bars: Sequence[MarketBar],
     position: int,
+    experts: Sequence[Any],
     *,
     horizon_bars: int,
     experiment_id: str,
-    split_id: str | None,
 ) -> list[ExpertPrediction]:
-    """Run every expert on the trailing window ending at ``position`` only."""
-    window = bars[max(0, position + 1 - _EXPERT_WINDOW_BARS) : position + 1]
-    latest_available = max((bar.available_at for bar in window), key=_utc)
-    bar = bars[position]
-    prepared = {
-        "asset": asset,
-        "close": tuple(b.close for b in window),
-        "event_at": tuple(b.event_at for b in window),
-        "available_at": tuple(b.available_at for b in window),
-    }
-    context = PredictionContext(
-        event_at=bar.event_at,
-        available_at=latest_available,
-        decision_at=max(bar.event_at, latest_available, key=_utc),
-        horizon_bars=horizon_bars,
-        experiment_id=experiment_id,
-        split_id=split_id,
+    """Run each expert on exactly its trailing window ending at ``position``."""
+    predictions: list[ExpertPrediction] = []
+    for expert in experts:
+        need, ohlcv = _EXPERT_INPUTS[expert.expert_id]
+        window = bars[max(0, position + 1 - need) : position + 1]
+        latest_available = max((bar.available_at for bar in window), key=_utc)
+        prepared: dict[str, object] = {
+            "asset": asset,
+            "close": tuple(b.close for b in window),
+            "event_at": tuple(b.event_at for b in window),
+            "available_at": tuple(b.available_at for b in window),
+        }
+        if ohlcv:
+            prepared |= {
+                "open": tuple(b.open for b in window),
+                "high": tuple(b.high for b in window),
+                "low": tuple(b.low for b in window),
+                "volume": tuple(b.volume for b in window),
+            }
+        context = PredictionContext(
+            event_at=bars[position].event_at,
+            available_at=latest_available,
+            decision_at=max(bars[position].event_at, latest_available, key=_utc),
+            horizon_bars=horizon_bars,
+            experiment_id=experiment_id,
+        )
+        predictions.extend(expert.predict(prepared, context).predictions)
+    return predictions
+
+
+def _volatility_regimes(bars: Sequence[MarketBar]) -> list[str]:
+    """Causal per-bar regime: 20-bar RMS vol above its prior 252-bar median."""
+    closes = pd.Series([bar.close for bar in bars], dtype="float64")
+    vol = np.sqrt(
+        (np.log(closes / closes.shift(1)) ** 2).rolling(_REGIME_VOL_BARS).mean()
     )
-    return [p for e in _EXPERTS for p in e.predict(prepared, context).predictions]
+    median = vol.shift(1).rolling(_REGIME_MEDIAN_BARS).median()
+    return [
+        "unknown" if pd.isna(m) or pd.isna(v) else ("high" if v > m else "low")
+        for v, m in zip(vol, median)
+    ]
 
 
 def _oof_rows(
@@ -315,15 +411,16 @@ def _oof_rows(
 
     The target enters at the next bar's open (the engine's fill) and exits at
     the close ``horizon_bars`` bars after the decision bar. Expert scores are
-    computed once for every pre-holdout position; the per-fold ridge stacker
+    computed once for every pre-holdout position; each per-fold ridge stacker
     fits only on that fold's purged training positions.
     """
     h = config.horizon_bars
     ordinary_stop = len(plan.label_end_positions)
-    names = tuple(e.expert_id for e in _EXPERTS)
-    ensemble = StaticEnsemble(_ensemble_config(config))
+    experts = _experts(config)
+    ensembles = _ensembles(config)
     slots = {slot.sample_position: slot for slot in plan.oof_slots}
     rows: list[dict[str, Any]] = []
+    regimes: dict[str, list[str]] = {}
 
     def row(asset: str, p: int, predictor: str, score: float) -> dict[str, Any]:
         bars = bars_by_asset[asset]
@@ -338,21 +435,23 @@ def _oof_rows(
             "fold_index": slot.fold_index,
             "split_id": slot.split_id,
             "role": slot.role.value,
+            "regime": regimes[asset][p],
             "score": score,
             "forward_return": exit_.close / entry.open - 1.0,
         }
 
-    # Scores never touch holdout bars: positions stop at the ordinary boundary.
+    # Scores and regimes never touch holdout bars: both stop at the boundary.
     scores: dict[str, dict[int, dict[str, float]]] = {}
     for asset, bars in sorted(bars_by_asset.items()):
+        regimes[asset] = _volatility_regimes(bars[:ordinary_stop])
         predictions = {
             p: _predict(
                 asset,
                 bars,
                 p,
+                experts,
                 horizon_bars=h,
                 experiment_id=plan.attempt_id,
-                split_id=None,
             )
             for p in range(ordinary_stop)
         }
@@ -361,87 +460,149 @@ def _oof_rows(
             for p, preds in predictions.items()
         }
         slot_predictions = [pred for p in slots for pred in predictions[p]]
-        combined = ensemble.combine(ExpertResult(tuple(slot_predictions)))
         position_of = {_utc(bar.event_at): p for p, bar in enumerate(bars)}
         for pred in slot_predictions:
-            p = position_of[_utc(pred.event_at)]
-            rows.append(row(asset, p, pred.expert_id, pred.score))
-        for decision in combined.decisions:
-            if decision.combined_score is not None:
-                p = position_of[_utc(decision.event_at)]
-                rows.append(row(asset, p, ENSEMBLE_PREDICTOR, decision.combined_score))
+            rows.append(
+                row(asset, position_of[_utc(pred.event_at)], pred.expert_id, pred.score)
+            )
+        for name, ensemble in ensembles.items():
+            members = {w.expert_id for w in ensemble.config.experts}
+            combined = ensemble.combine(
+                ExpertResult(
+                    tuple(q for q in slot_predictions if q.expert_id in members)
+                )
+            )
+            for decision in combined.decisions:
+                if decision.combined_score is not None:
+                    p = position_of[_utc(decision.event_at)]
+                    rows.append(row(asset, p, name, decision.combined_score))
 
-    def complete(asset: str, p: int) -> bool:
-        return len(scores[asset][p]) == len(names)
-
-    def features(asset: str, p: int) -> list[float]:
-        return [scores[asset][p][name] for name in names]
+    def target(asset: str, p: int) -> float:
+        return (
+            bars_by_asset[asset][p + h].close / bars_by_asset[asset][p + 1].open - 1.0
+        )
 
     stacker = RidgeStacker(config.stacker_alpha)
     reference = bars_by_asset[min(bars_by_asset)]
-    fold_cards = []
-    for fold in plan.folds:
-        train = [
-            (asset, p)
-            for asset in sorted(bars_by_asset)
-            for p in fold.train_positions
-            if complete(asset, p)
-        ]
-        fitted = stacker.fit(
-            np.array([features(a, p) for a, p in train]),
-            np.array(
-                [
-                    bars_by_asset[a][p + h].close / bars_by_asset[a][p + 1].open - 1.0
-                    for a, p in train
-                ]
-            ),
-        )
-        held_out = [
-            (asset, p)
-            for asset in sorted(bars_by_asset)
-            for p in fold.validation_positions + fold.test_positions
-            if complete(asset, p)
-        ]
-        predicted = fitted.predict(np.array([features(a, p) for a, p in held_out]))
-        rows += [
-            row(a, p, STACKER_PREDICTOR, float(score))
-            for (a, p), score in zip(held_out, predicted)
-        ]
-        fold_cards.append(
-            {
+    stacker_reports: dict[str, Any] = {}
+    for predictor, names in _stacker_features(config).items():
+
+        def complete(asset: str, p: int, names: tuple[str, ...] = names) -> bool:
+            return all(name in scores[asset][p] for name in names)
+
+        def features(asset: str, p: int, names: tuple[str, ...] = names) -> list[float]:
+            return [scores[asset][p][name] for name in names]
+
+        fold_cards = []
+        for fold in plan.folds:
+            train = [
+                (asset, p)
+                for asset in sorted(bars_by_asset)
+                for p in fold.train_positions[-(config.stacker_window_bars or 0) :]
+                if complete(asset, p)
+            ]
+            card: dict[str, Any] = {
                 "fold_index": fold.manifest.fold_index,
                 "split_id": fold.manifest.split_id,
-                "train_label_end_max": _utc(
-                    max((reference[p + h].event_at for _, p in train), key=_utc)
-                ),
                 "evaluation_start": _utc(
                     reference[fold.validation_positions[0]].event_at
                 ),
-                "model": fitted.to_dict(names),
             }
-        )
+            if len(train) < 2 * (len(names) + 1):
+                # e.g. before a long warm-up: no fit, no predictions, reported.
+                fold_cards.append(
+                    card | {"skipped": "insufficient complete training rows"}
+                )
+                continue
+            fitted = stacker.fit(
+                np.array([features(a, p) for a, p in train]),
+                np.array([target(a, p) for a, p in train]),
+            )
+            held_out = [
+                (asset, p)
+                for asset in sorted(bars_by_asset)
+                for p in fold.validation_positions + fold.test_positions
+                if complete(asset, p)
+            ]
+            if held_out:
+                predicted = fitted.predict(
+                    np.array([features(a, p) for a, p in held_out])
+                )
+                rows += [
+                    row(a, p, predictor, float(score))
+                    for (a, p), score in zip(held_out, predicted)
+                ]
+            fold_cards.append(
+                card
+                | {
+                    "train_label_end_max": _utc(
+                        max((reference[p + h].event_at for _, p in train), key=_utc)
+                    ),
+                    "model": fitted.to_dict(names),
+                }
+            )
 
-    coef = pd.DataFrame([card["model"]["standardized_coef"] for card in fold_cards])
-    stacker_report = {
-        "predictor": STACKER_PREDICTOR,
-        "alpha": config.stacker_alpha,
-        "features": list(names),
-        "folds": fold_cards,
-        "coef_summary": {
-            name: {
-                "mean": float(coef[name].mean()),
-                "positive_fraction": float((coef[name] > 0.0).mean()),
-            }
-            for name in names
-        },
-        "note": (
-            "Trained on expert scores at training positions, which is valid "
-            "only because V0 experts have no fitted parameters; learned experts "
-            "must feed the stacker their out-of-fold rows instead."
-        ),
-    }
+        fitted_cards = [c for c in fold_cards if "model" in c]
+        coef = pd.DataFrame([c["model"]["standardized_coef"] for c in fitted_cards])
+        stacker_reports[predictor] = {
+            "predictor": predictor,
+            "alpha": config.stacker_alpha,
+            "features": list(names),
+            "folds": fold_cards,
+            "fitted_folds": len(fitted_cards),
+            "coef_summary": (
+                {
+                    name: {
+                        "mean": float(coef[name].mean()),
+                        "positive_fraction": float((coef[name] > 0.0).mean()),
+                    }
+                    for name in names
+                }
+                if fitted_cards
+                else {}
+            ),
+            "note": (
+                "Trained on expert scores at training positions, which is valid "
+                "only because these experts have no fitted parameters; learned "
+                "experts must feed a stacker their out-of-fold rows instead."
+            ),
+        }
     frame = pd.DataFrame(rows).sort_values(["predictor", "asset", "event_at"])
-    return frame, stacker_report
+    return frame, stacker_reports
+
+
+def _incremental(rows: pd.DataFrame, evaluation: Mapping[str, Any]) -> dict[str, Any]:
+    """Pre-registered v1 criteria: orthogonality and paired per-fold IC gain."""
+    correlation = evaluation["roles"]["test"]["score_correlation"]
+    v0 = [e.expert_id for e in _V0_EXPERTS]
+    experts: dict[str, Any] = {}
+    for expert in _V1_EXPERTS:
+        pairs = [
+            abs(value)
+            for name in v0
+            if (value := correlation.get(expert.expert_id, {}).get(name)) is not None
+        ]
+        max_corr = max(pairs) if pairs else None
+        delta = paired_fold_delta(
+            rows, base=STACKER_PREDICTOR, other=f"stacker.v0+{expert.expert_id}"
+        )
+        experts[expert.expert_id] = {
+            "max_abs_corr_with_v0": max_corr,
+            "orthogonal": max_corr is not None
+            and max_corr <= INCREMENTAL_CRITERIA["orthogonal_max_abs_corr"],
+            "delta_vs_v0_stacker": delta,
+            "adds_incremental_information": bool(
+                delta["t"] is not None
+                and delta["mean_delta"] > 0.0
+                and delta["t"] >= INCREMENTAL_CRITERIA["incremental_min_t"]
+            ),
+        }
+    experts["all"] = {
+        "delta_vs_v0_stacker": paired_fold_delta(
+            rows, base=STACKER_PREDICTOR, other="stacker.all"
+        )
+    }
+    return {"criteria": dict(INCREMENTAL_CRITERIA), "experts": experts}
 
 
 def _markdown(report: Mapping[str, Any]) -> str:
@@ -489,6 +650,58 @@ def _markdown(report: Mapping[str, Any]) -> str:
                 + " |"
             )
         lines.append("")
+    portfolio = report["portfolio"]
+    span = portfolio["span"]
+    lines += [
+        f"## Stitched OOS portfolio ({span['bars']} bars, "
+        f"{span['first_decision_at'][:10]} to {span['last_execution_at'][:10]})",
+        "",
+        "| Predictor | Costs | Total return | Annual | Sharpe | Max DD "
+        "| Avg turnover |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for name, modes in portfolio["predictors"].items():
+        for mode, m in modes.items():
+            lines.append(
+                f"| {name} | {mode} | {cell(m['total_return'], '{:+.1%}')} "
+                f"| {cell(m['annual_return'], '{:+.1%}')} "
+                f"| {cell(m['sharpe'], '{:+.2f}')} "
+                f"| {cell(m['max_drawdown'], '{:.1%}')} "
+                f"| {cell(m['avg_turnover'], '{:.3f}')} |"
+            )
+    b = portfolio["equal_weight_benchmark"]
+    lines += [
+        f"| equal-weight benchmark | none | {cell(b['total_return'], '{:+.1%}')} "
+        f"| {cell(b['annual_return'], '{:+.1%}')} | {cell(b['sharpe'], '{:+.2f}')} "
+        f"| {cell(b['max_drawdown'], '{:.1%}')} | — |",
+        "",
+    ]
+    incremental = report.get("incremental")
+    if incremental:
+        criteria = incremental["criteria"]
+        lines += [
+            "## Incremental information (pre-registered criteria)",
+            "",
+            f"Orthogonal: max |rank corr| with any V0 expert <= "
+            f"{criteria['orthogonal_max_abs_corr']}. Adds information: paired "
+            f"per-fold test IC gain of `stacker.v0+X` over `stacker.ridge` > 0 "
+            f"with t >= {criteria['incremental_min_t']}.",
+            "",
+            "| Expert | Max abs corr with V0 | Orthogonal | Mean fold IC gain "
+            "| Gain t | Folds improved | Adds information |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for name, entry in incremental["experts"].items():
+            delta = entry["delta_vs_v0_stacker"]
+            lines.append(
+                f"| {name} | {cell(entry.get('max_abs_corr_with_v0'), '{:.2f}')} "
+                f"| {entry.get('orthogonal', '—')} "
+                f"| {cell(delta['mean_delta'], '{:+.4f}')} "
+                f"| {cell(delta['t'], '{:+.2f}')} "
+                f"| {cell(delta['positive_fraction'], '{:.0%}')} "
+                f"| {entry.get('adds_incremental_information', '—')} |"
+            )
+        lines.append("")
     stacker = report["stacker"]
     lines += [
         f"## Ridge stacker (alpha {stacker['alpha']}, "
@@ -508,7 +721,10 @@ def _markdown(report: Mapping[str, Any]) -> str:
 
 
 _CAVEATS = (
-    "Prediction quality only: no sizing, costs, or P&L.",
+    "IC and hit rate measure prediction quality only; the portfolio section "
+    "adds sizing, engine fills, and slippage.",
+    "The stitched portfolio uses validation and test slots, valid only while "
+    "nothing is fitted on validation labels. Shorts carry no borrow cost.",
     "Forward horizons overlap within a fold, so pooled IC carries no "
     "significance claim; fold IC t treats folds as independent.",
     "Universe is the caller's symbol list, not point-in-time membership "
@@ -518,22 +734,27 @@ _CAVEATS = (
 )
 
 
-def run_research(
-    workspace: Path, snapshot_id: str, config: ResearchConfig | None = None
-) -> ResearchResult:
-    """Register, evaluate, and report one OOF research attempt on a snapshot."""
-    config = config or ResearchConfig()
-    workspace = Path(workspace)
+def _load_snapshot(
+    workspace: Path, snapshot_id: str
+) -> tuple[Any, dict[str, tuple[MarketBar, ...]]]:
     snapshot = DatasetSnapshotStore(workspace / "snapshots").load(snapshot_id)
-    assets = snapshot.manifest.assets
     bars_by_asset = {
         asset: tuple(bar for bar in snapshot.bars if bar.asset == asset)
-        for asset in assets
+        for asset in snapshot.manifest.assets
     }
-    ledger = ExperimentLedger(workspace / "experiment_ledger.jsonl")
-    spec = ExperimentSpec(
+    return snapshot, bars_by_asset
+
+
+def _spec(
+    snapshot: Any,
+    snapshot_id: str,
+    bars_by_asset: Mapping[str, tuple[MarketBar, ...]],
+    config: ResearchConfig,
+) -> ExperimentSpec:
+    assets = snapshot.manifest.assets
+    return ExperimentSpec(
         evaluation_protocol_id=_protocol(config, bars_by_asset[assets[0]]).protocol_id,
-        expert_config_ids=tuple(e.config_id for e in _EXPERTS),
+        expert_config_ids=tuple(e.config_id for e in _experts(config)),
         ensemble_config_id="quorum:research:ensemble:equal-v1",
         target_definition_id=(
             f"quorum:target:next-open-to-close:h{config.horizon_bars}:v1"
@@ -542,14 +763,108 @@ def run_research(
         data_snapshot_id=snapshot_id,
         data_cutoff_at=max((bar.event_at for bar in snapshot.bars), key=_utc),
         universe_id=_universe_id(assets),
-        cost_model_id="quorum:cost:none:prediction-evaluation",
-        code_id="quorum:research:v2",
+        cost_model_id="quorum:cost:engine-us-slippage-grid",
+        code_id="quorum:research:v3",
         config_id=config.config_id,
         random_seed=0,
         trial_family_id=TRIAL_FAMILY_ID,
     )
+
+
+def _preregistration_path(workspace: Path, family: str) -> Path:
+    if not _FAMILY_NAME_RE.fullmatch(family):
+        raise ValueError("family must be a short name of letters, digits, . _ -")
+    return Path(workspace) / "preregistrations" / f"{family}.json"
+
+
+def preregister(
+    workspace: Path,
+    snapshot_id: str,
+    family: str,
+    configs: Mapping[str, ResearchConfig],
+) -> dict[str, str]:
+    """Register every variant of a family before any of them produces results.
+
+    The ledger's order is the proof: all registrations precede every run. The
+    declaration file is written once and never overwritten.
+    """
+    path = _preregistration_path(workspace, family)
+    if path.exists():
+        raise FileExistsError(f"preregistration {family!r} already exists")
+    if not configs:
+        raise ValueError("a preregistered family needs at least one variant")
+    snapshot, bars_by_asset = _load_snapshot(Path(workspace), snapshot_id)
+    ledger = ExperimentLedger(Path(workspace) / "experiment_ledger.jsonl")
+    variants = {}
+    for name in sorted(configs):
+        attempt = ledger.register(
+            _spec(snapshot, snapshot_id, bars_by_asset, configs[name])
+        )
+        variants[name] = {
+            "attempt_id": attempt.attempt_id,
+            "spec_fingerprint": attempt.spec_fingerprint,
+            "config": asdict(configs[name]),
+        }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    declaration = {
+        "family": family,
+        "snapshot_id": snapshot_id,
+        "registered_at": datetime.now(UTC).isoformat(),
+        "variants": variants,
+    }
+    with path.open("x", encoding="utf-8") as handle:
+        handle.write(json.dumps(declaration, indent=2, sort_keys=True) + "\n")
+    return {name: v["attempt_id"] for name, v in variants.items()}
+
+
+def run_preregistered(workspace: Path, family: str) -> dict[str, "ResearchResult"]:
+    """Run every still-registered variant of a preregistered family."""
+    declaration = json.loads(
+        _preregistration_path(workspace, family).read_text(encoding="utf-8")
+    )
+    ledger = ExperimentLedger(Path(workspace) / "experiment_ledger.jsonl")
+    results = {}
+    for name, variant in sorted(declaration["variants"].items()):
+        if ledger.get(variant["attempt_id"]).state is not ExperimentState.REGISTERED:
+            continue
+        results[name] = run_research(
+            workspace,
+            declaration["snapshot_id"],
+            ResearchConfig(**variant["config"]),
+            attempt_id=variant["attempt_id"],
+        )
+    return results
+
+
+def run_research(
+    workspace: Path,
+    snapshot_id: str,
+    config: ResearchConfig | None = None,
+    *,
+    attempt_id: str | None = None,
+) -> ResearchResult:
+    """Evaluate and report one OOF research attempt on a snapshot.
+
+    Without ``attempt_id`` the attempt is registered now. With it, a previously
+    preregistered attempt runs, but only if it is still REGISTERED and its
+    registered spec matches this snapshot and config exactly.
+    """
+    config = config or ResearchConfig()
+    workspace = Path(workspace)
+    snapshot, bars_by_asset = _load_snapshot(workspace, snapshot_id)
+    assets = snapshot.manifest.assets
+    ledger = ExperimentLedger(workspace / "experiment_ledger.jsonl")
+    spec = _spec(snapshot, snapshot_id, bars_by_asset, config)
+    if attempt_id is not None:
+        record = ledger.get(attempt_id)
+        if record.state is not ExperimentState.REGISTERED:
+            raise ValueError(
+                f"attempt {attempt_id} is {record.state.value}, not REGISTERED"
+            )
+        if record.attempt.spec_fingerprint != spec.fingerprint:
+            raise ValueError("config does not match the registered spec")
     # Registration precedes every result-producing step.
-    attempt = ledger.register(spec)
+    attempt = record.attempt if attempt_id is not None else ledger.register(spec)
     ledger.transition(attempt.attempt_id, ExperimentState.RUNNING)
     try:
         calendar = _shared_calendar(bars_by_asset)
@@ -561,14 +876,39 @@ def run_research(
             tuple(TimeInterval(bar.start_at, bar.event_at) for bar in calendar),
             tuple(p + config.horizon_bars for p in range(ordinary_stop)),
         )
-        rows, stacker_report = _oof_rows(plan, bars_by_asset, config)
+        rows, stacker_reports = _oof_rows(plan, bars_by_asset, config)
         slot_counts = {
             role.value: sum(slot.role is role for slot in plan.oof_slots) * len(assets)
             for role in {slot.role for slot in plan.oof_slots}
         }
         evaluation = evaluate_predictions(rows, slot_counts=slot_counts)
+        incremental = (
+            _incremental(rows, evaluation) if config.expert_set == "v1" else None
+        )
+        run_dir = workspace / "runs" / attempt.attempt_id
+        run_dir.mkdir(parents=True)
+        portfolio = run_oos_portfolios(
+            rows,
+            bars_by_asset,
+            holdout_start=protocol.final_holdout.start,
+            horizon_bars=config.horizon_bars,
+            experiment_id=attempt.attempt_id,
+            risk_config=RiskPolicyConfig(
+                max_gross_exposure=config.max_gross_exposure,
+                max_abs_weight_per_asset=config.max_weight_per_asset,
+                max_turnover=config.max_turnover,
+            ),
+            output_dir=run_dir / "portfolio",
+            construction=config.portfolio_construction,
+            rebalance_every_bars=config.rebalance_every_bars,
+        )
+        results = {
+            "evaluation": evaluation,
+            "portfolio": portfolio,
+            "incremental": incremental,
+        }
         metrics_sha256 = (
-            "sha256:" + hashlib.sha256(_canonical_json(evaluation).encode()).hexdigest()
+            "sha256:" + hashlib.sha256(_canonical_json(results).encode()).hexdigest()
         )
         holdout = protocol.final_holdout
         report = {
@@ -598,12 +938,13 @@ def run_research(
                 "attempt_count": ledger.count_attempts(trial_family_id=TRIAL_FAMILY_ID),
             },
             "evaluation": evaluation,
-            "stacker": stacker_report,
+            "incremental": incremental,
+            "stacker": stacker_reports[STACKER_PREDICTOR],
+            "stackers": stacker_reports,
+            "portfolio": portfolio,
             "metrics_sha256": metrics_sha256,
             "caveats": list(_CAVEATS),
         }
-        run_dir = workspace / "runs" / attempt.attempt_id
-        run_dir.mkdir(parents=True)
         report_path = run_dir / "research_report.json"
         predictions_path = run_dir / "oof_predictions.csv"
         report_path.write_text(
@@ -654,7 +995,40 @@ def main(argv: Sequence[str] | None = None) -> int:
     run.add_argument("--workspace", required=True, type=Path)
     run.add_argument("--snapshot-id", required=True)
     run.add_argument("--horizon-bars", type=int, default=ResearchConfig().horizon_bars)
+    prereg = commands.add_parser(
+        "preregister", help="register a family of variants before running any"
+    )
+    prereg.add_argument("--workspace", required=True, type=Path)
+    prereg.add_argument("--snapshot-id", required=True)
+    prereg.add_argument("--family", required=True)
+    prereg.add_argument(
+        "--variants-json",
+        required=True,
+        type=Path,
+        help="JSON object mapping variant name to ResearchConfig overrides",
+    )
+    run_family = commands.add_parser(
+        "run-preregistered", help="run a preregistered family's variants"
+    )
+    run_family.add_argument("--workspace", required=True, type=Path)
+    run_family.add_argument("--family", required=True)
     args = parser.parse_args(argv)
+
+    if args.command == "preregister":
+        overrides = json.loads(args.variants_json.read_text(encoding="utf-8"))
+        declared = preregister(
+            args.workspace,
+            args.snapshot_id,
+            args.family,
+            {name: ResearchConfig(**o) for name, o in overrides.items()},
+        )
+        print(_canonical_json(declared))
+        return 0
+    if args.command == "run-preregistered":
+        results = run_preregistered(args.workspace, args.family)
+        reports = {name: str(r.report_path) for name, r in results.items()}
+        print(_canonical_json(reports))
+        return 0
 
     if args.command == "ingest":
         manifest = ingest_daily_bars(

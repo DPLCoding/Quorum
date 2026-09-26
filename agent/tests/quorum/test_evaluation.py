@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -80,3 +81,97 @@ def test_coverage_saturation_and_per_asset_ic() -> None:
     assert report["roles"]["test"]["asset_ic"]["partial"]["A"] == pytest.approx(
         partial["ic"]
     )
+
+
+def test_sign_agreement_and_regime_ic() -> None:
+    perfect = _rows("perfect", [r * 10 for r in RETURNS])
+    inverted = _rows("inverted", [-r * 10 for r in RETURNS])
+    for group in (perfect, inverted):
+        for i, row in enumerate(group):
+            row["regime"] = "high" if i % 2 else "low"
+    report = _evaluate(perfect, inverted)
+    test = report["roles"]["test"]
+
+    assert test["sign_agreement"]["perfect"]["inverted"] == 0.0
+    assert test["sign_agreement"]["perfect"]["perfect"] == 1.0
+    assert test["regime_ic"]["perfect"] == {
+        "high": pytest.approx(1.0),
+        "low": pytest.approx(1.0),
+    }
+
+
+def test_paired_fold_delta_compares_the_same_folds() -> None:
+    from src.quorum.evaluation import paired_fold_delta
+
+    noisy = [0.1, -0.2, 0.3, 0.1, 0.2, -0.1, -0.4, -0.3]
+    frame = pd.DataFrame(
+        _rows("base", noisy) + _rows("better", [r * 10 for r in RETURNS])
+    )
+    delta = paired_fold_delta(frame, base="base", other="better", role="test")
+
+    assert delta["fold_count"] == 2
+    assert delta["positive_fraction"] == 1.0
+    assert delta["mean_delta"] > 0.0
+    assert set(delta) == {
+        "fold_count",
+        "mean_delta",
+        "t",
+        "positive_fraction",
+        "fold_deltas",
+    }
+
+
+# ------------------------------------------------ Ledoit-Wolf Sharpe difference
+
+
+def _paired_null(rng: np.random.Generator, n: int) -> tuple[np.ndarray, np.ndarray]:
+    """Equal-Sharpe paired returns with shared volatility clustering and 0.8 corr."""
+    log_vol = np.zeros(n)
+    for t in range(1, n):
+        log_vol[t] = 0.95 * log_vol[t - 1] + 0.25 * rng.standard_normal()
+    sigma = 0.01 * np.exp(log_vol - log_vol.mean())
+    z = rng.standard_normal(n)
+    e1, e2 = rng.standard_normal(n), rng.standard_normal(n)
+    a = 0.0004 + sigma * (0.8 * z + 0.6 * e1)
+    b = 0.0004 + sigma * (0.8 * z + 0.6 * e2)
+    return a, b
+
+
+def test_sharpe_difference_test_is_deterministic_and_matches_sample_sharpes() -> None:
+    from src.quorum.evaluation import sharpe_difference_test
+
+    a, b = _paired_null(np.random.default_rng(1), 300)
+    first = sharpe_difference_test(a, b, resamples=499, seed=7)
+    again = sharpe_difference_test(a, b, resamples=499, seed=7)
+    assert first == again
+    daily = a.mean() / a.std() - b.mean() / b.std()
+    assert first["sharpe_difference_daily"] == pytest.approx(daily)
+    assert first["sharpe_difference_annualized"] == pytest.approx(daily * 252**0.5)
+    assert first["block_length"] == round(300 ** (1 / 3))
+    assert 0.0 < first["p_value_one_sided"] <= 1.0
+
+
+def test_sharpe_difference_test_holds_size_under_a_dependent_null() -> None:
+    from src.quorum.evaluation import sharpe_difference_test
+
+    rng = np.random.default_rng(2026)
+    rejections = sum(
+        sharpe_difference_test(*_paired_null(rng, 250), resamples=299, seed=i)[
+            "p_value_one_sided"
+        ]
+        <= 0.05
+        for i in range(120)
+    )
+    # Nominal 5%; binomial sd over 120 draws is ~2%. JK-style IID tests drift.
+    assert rejections / 120 <= 0.12
+
+
+def test_sharpe_difference_test_detects_a_real_improvement() -> None:
+    from src.quorum.evaluation import sharpe_difference_test
+
+    rng = np.random.default_rng(3)
+    base, _ = _paired_null(rng, 500)
+    better = base + 0.0015  # same risk, clearly higher mean
+    result = sharpe_difference_test(better, base, resamples=999, seed=1)
+    assert result["sharpe_difference_annualized"] > 1.0
+    assert result["p_value_one_sided"] < 0.01

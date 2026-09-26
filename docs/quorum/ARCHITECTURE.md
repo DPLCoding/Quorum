@@ -799,6 +799,213 @@ no fitted parameters; experts that learn must feed the stacker their
 out-of-fold rows instead. Expert scores are computed only for pre-holdout
 positions.
 
+#### Task 11 stitched out-of-sample portfolio
+
+`src.quorum.portfolio.run_oos_portfolios` turns each predictor's OOF scores
+(the three experts, the ensemble, and the stacker) into one continuous
+execution history. It reimplements no execution logic. The pipeline is:
+
+1. A single-predictor `StaticEnsemble` wraps the predictor's scores.
+2. The frozen `FixedRiskPolicy` sizes them, with the caps declared in
+   `ResearchConfig`: gross 1.0, 0.25 per name, turnover 0.5 per rebalance.
+3. `VibeSignalAdapter` passes observed snapshot `bar_starts`, so each
+   decision at a close precedes the next open.
+4. The unchanged `GlobalEquityEngine` executes.
+
+The engine runs once per cost level: frictionless, 5 bp (the engine's US
+default; US commission is zero), and a 15 bp stress level. The report includes
+the engine's daily-rebalanced equal-weight benchmark over the same span.
+
+The stream uses validation and test slots, which together tile the OOF span
+contiguously. The purged validation tail holds the previous target. This is
+valid only while nothing is fitted on validation labels; once calibration uses
+validation, the portfolio must switch to test-only slots. Execution never
+reaches the final holdout. Short positions carry no borrow cost. Each run keeps
+the engine's normal artifacts under `runs/<attempt_id>/portfolio/<predictor>/<mode>/`,
+and the report fingerprint covers evaluation and portfolio results.
+
+The first real-data run exposed a Task 6 defect. Dividing weights by their gross
+sum could leave the sum one rounding step above the cap
+(1.0000000000000002), which the zero-leverage record correctly rejected. The
+risk policy now steps the gross scale, and any rounding-level excess after
+turnover interpolation, down by whole ulps until the exact sum complies.
+Larger excess still fails its invariant.
+
+#### Task 12 pre-registered variant families
+
+`preregister(workspace, snapshot_id, family, configs)` derives every variant's
+`ExperimentSpec` and registers all of them in the ledger before any variant
+runs. It then writes an immutable declaration to
+`<workspace>/preregistrations/<family>.json`; a second declaration with the same
+name fails. The ledger's record order is the proof: every registration precedes
+every lifecycle event of the family. `run_research(..., attempt_id=...)` executes
+a registered attempt only while it is still `REGISTERED` and only if the spec
+derived from the supplied snapshot and config matches the registered
+fingerprint exactly. `run-preregistered` runs a family's remaining variants.
+Every variant, including failed ones, counts in the trial family.
+
+The first family (`portfolio-v1`) changes one factor each against the Task 11
+baseline:
+
+- `portfolio_construction="long_only_tilt"`: equal weight tilted by
+  `(1 + score) / 2`, the fair comparison with the equal-weight benchmark.
+- `rebalance_every_bars=5`: decisions every fifth bar, matching the horizon.
+- `stacker_window_bars=756`: the stacker fits only the most recent three years
+  of training rows.
+
+The long-only tilt exposed a Vibe engine performance defect.
+`BaseEngine._weighted_holding_bars` re-read the whole active position lifecycle
+on every partial reduction and rescaled every lot at each one. Its bound, "since
+the last full close", never applies to a position that is rebalanced daily and
+never fully closed. That made one call quadratic and a run roughly cubic, about
+25 minutes per engine run.
+
+The function now folds each symbol's lots forward incrementally, keeping
+proportional reductions as one running scale factor. That costs amortized O(1)
+per call. A randomized test checks it against the verbatim old algorithm, and a
+real-data replay produced identical equity, positions, fills, trades, and
+metrics, with holding bars equal to within 2e-14 relative.
+
+The first tilt attempt was interrupted for runtime, with a wrong diagnosis
+(basket scaling) recorded in its outcome. A second attempt with a 2% cash
+buffer was also interrupted, and its outcome records the correction. Neither
+result was viewed before stopping. The original gross-1.0 tilt spec, with the
+same fingerprint as its preregistration, then ran as a new attempt
+(`portfolio-v1-amend-2`). All three attempts count in the trial family.
+
+#### Task 13 independent expert round v1
+
+[`EXPERTS_V1.md`](EXPERTS_V1.md) freezes four time-series experts, and it was
+written before any of them was implemented or evaluated. Each reads information
+the V0 close-only experts ignore:
+
+- volatility regime: uncentered RMS volatility, 20 against 252 returns, with no
+  direction;
+- overnight momentum: close-to-next-open gaps only;
+- abnormal volume: volume only, never price;
+- range reversal: close location within the high-low range.
+
+A shared OHLCV normalizer reuses the close contract's information-time checks.
+The research runner gives each expert exactly its declared trailing window.
+V0 scores are unchanged, because each V0 expert only reads its last N bars.
+
+`ResearchConfig.expert_set="v1"` adds:
+
+- the `ensemble.all` equal-weight ensemble;
+- one ridge stacker per feature set: `stacker.ridge` (V0), `stacker.v0+<expert>`
+  for each new expert, and `stacker.all`. Folds without enough complete training
+  rows, such as before the 253-bar warm-up, are recorded as skipped;
+- a causal volatility-regime label on every row;
+- an `incremental` report section that applies the pre-registered criteria.
+  *Orthogonal* means max |rank corr| with every V0 expert ≤ 0.5. *Adds
+  information* means the paired per-fold test IC gain over `stacker.ridge` is
+  positive with t ≥ 2.5.
+
+Evaluation now also reports a sign-agreement matrix and IC by regime. The
+future-shock leak trap now shocks volume as well as OHLC, runs for both expert
+sets, and was shown to catch a planted next-bar volume leak.
+
+#### Task 14 broker-free prospective prediction ledger
+
+`src.quorum.prospective` is roadmap 0.9's first stage. It records prospective
+decisions and hypothetical fills. It never contacts a broker, and a test
+forbids any `src.trading`, `src.live`, or broker SDK import.
+
+- **`declare_study`** freezes, before any decision:
+  - the symbols;
+  - the candidates: the equal-weight `benchmark` control, `ensemble_tilt`,
+    `trend_tilt`, and `vol_regime_tilt`, the one hypothesis under test, which
+    Task 13 noticed after the fact;
+  - the long-only tilt construction and risk caps (per-name cap 2/N, so a
+    neutral score is equal weight; gross 1.0; turnover 0.5);
+  - next-open execution and 5 bp slippage;
+  - the expert versions, and `broker: null`.
+
+  The declaration is written once, and its hash is the first record of a
+  hash-chained ledger. Every later read verifies both.
+- **`record_day`** runs daily after the close:
+  - It fetches recent bars and keeps only bars closed at the wall clock.
+    Excluded unclosed bars are counted.
+  - It fails closed to an explicit `skip` record when assets' recent calendars
+    differ.
+  - It snapshots the bars and scores the last closed bar with the frozen
+    experts. It sizes each candidate by replaying the frozen `FixedRiskPolicy`
+    over that candidate's recorded score history, so turnover state is exactly
+    reproducible.
+  - It appends one decision record with `decision_at`, the wall-clock
+    `recorded_at`, the snapshot ID, all expert scores, and each candidate's
+    targets.
+  - A day on which any asset abstains records no targets and stays out of the
+    policy history, so evaluation holds the previous weights.
+  - It is idempotent per decision bar.
+- **`evaluate_study`** verifies the chain and the declaration, then marks every
+  candidate to market at every session open (`_simulate_portfolio`).
+  - Positions drift with their own open-to-open prices, and cash earns 0.
+  - A valid execution trades from the **drifted** pre-trade weights to the
+    targets and pays slippage on those actual trades.
+  - Missed, late, and abstaining days trade nothing, so the drifted portfolio
+    is held.
+  - A decision whose `recorded_at` is not before its execution open is **late**
+    and never counts. A decision whose execution bar is not yet observed is
+    pending.
+  - Every candidate therefore has one daily return series on identical dates.
+
+The prospective period starts at the study's first decision, and no earlier
+performance is evaluated. Recent bars, including the locked 2025 holdout span,
+are read only as warm-up inputs for today's scores and are never scored or
+evaluated. A missed day, such as when the machine was off, simply has no
+decision; the drifted portfolio is held and the gap is visible in the ledger.
+
+#### Task 15 pre-declaration corrections
+
+A review before freezing the first study found and fixed the following.
+
+- **Static-weights bug.** The first evaluator reset weights to target at every
+  execution and charged turnover against the previous targets. That gave every
+  candidate, the control included, a free rebalance, and it collapsed
+  multi-day gaps into single observations. Daily marking with drift replaces
+  it. Tests with unequal returns pin down:
+  - the drifted weights;
+  - turnover measured against the drifted weights;
+  - costs charged on the actual trades;
+  - the cash and equity identity;
+  - buy-and-hold drift;
+  - abstention being equivalent to no trade.
+
+  Two mutations, no drift and targets-based turnover, are each caught.
+  `FixedRiskPolicy` stays price-unaware: its turnover cap limits changes
+  between targets, as in research, while costs follow the actual trades.
+- **Confirmatory inference.** The test is a Ledoit & Wolf (2008) studentized
+  circular block bootstrap of the Sharpe difference, using
+  `src.quorum.evaluation.sharpe_difference_test`:
+  - Newey-West HAC with lag equal to the block length;
+  - block length `round(n^(1/3))`;
+  - 10,000 resamples, seed 0, one-sided.
+
+  It was chosen on methodological grounds, and only simulated data with a known
+  truth was used to check it. Under a symmetric null and a heavy-tailed
+  asymmetric null, it and Jobson-Korkie/Memmel both held size near 5%, so the
+  choice rests on Ledoit-Wolf not assuming IID-normal returns, not on a
+  measured size gap. Simulated power at two years and 0.95 correlation is
+  about 22% for a true annual Sharpe gain of +0.2, and about 59% for +0.5.
+- **The study itself.**
+  - The horizon is two years.
+  - The control is renamed `equal_weight_control`. The declaration and a test
+    confirm 0.0625 each, then 0.125 each with gross 1.0, for 8 symbols.
+  - Exposure, cash, downside volatility, turnover, and cost metrics are
+    reported for every candidate.
+  - SPY buy-and-hold is reported as a descriptive external reference.
+- **Explicit confirmatory outcomes.** The declaration spells out the mapping:
+  - n < 250 gives `insufficient_observations`;
+  - n ≥ 250 and p ≤ 0.05 gives `supported`;
+  - otherwise `not_supported`.
+
+  The code applies it through `_confirmatory_outcome`. Five fields appear in
+  every evaluation, including interim and insufficient ones: n, the annualized
+  Sharpe difference, the studentized statistic, the bootstrap p-value, and the
+  outcome. The procedure has no confidence interval, and its reported
+  uncertainty measure is the HAC standard error.
+
 ### Portfolio and risk
 
 Base execution normalizes requested gross weight, enforces cash/margin/lot/market

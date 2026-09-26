@@ -10,7 +10,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.quorum import DatasetSnapshotStore, ExperimentLedger, ExperimentState
+from src.quorum import (
+    DatasetSnapshotStore,
+    ExperimentAttempt,
+    ExperimentEvent,
+    ExperimentLedger,
+    ExperimentState,
+)
 from src.quorum.research import (
     ResearchConfig,
     daily_bars_from_frame,
@@ -162,17 +168,24 @@ def test_research_run_registers_first_keeps_holdout_locked_and_is_deterministic(
     assert later["trial_family"]["attempt_count"] == 2
 
 
-def test_future_bars_cannot_change_earlier_predictions(tmp_path: Path) -> None:
+@pytest.mark.parametrize("expert_set", ["v0", "v1"])
+def test_future_bars_cannot_change_earlier_predictions(
+    tmp_path: Path, expert_set: str
+) -> None:
+    from dataclasses import replace
+
     cutoff = 150
     shocked = {name: frame.copy() for name, frame in FRAMES.items()}
     for frame in shocked.values():
-        frame.iloc[cutoff + 1 :, :4] *= 3.0
+        frame.iloc[cutoff + 1 :, :5] *= 3.0  # open, high, low, close, volume
 
     results = []
     for name, frames in (("base", FRAMES), ("shocked", shocked)):
         workspace = tmp_path / name
         snapshot_id = _ingest(DatasetSnapshotStore(workspace / "snapshots"), frames)
-        results.append(run_research(workspace, snapshot_id, SMALL))
+        results.append(
+            run_research(workspace, snapshot_id, replace(SMALL, expert_set=expert_set))
+        )
 
     base, changed = (pd.read_csv(r.predictions_path) for r in results)
     # The cutoff bar's own close (16:00 New York) is the last unshocked value.
@@ -219,3 +232,177 @@ def test_cli_run_uses_default_config(
     printed = json.loads(capsys.readouterr().out)
     report = json.loads(Path(printed["report"]).read_text(encoding="utf-8"))
     assert report["config"]["horizon_bars"] == 5
+
+
+def test_stitched_oos_portfolio_is_causal_cost_ordered_and_holdout_free(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    snapshot_id = _ingest(DatasetSnapshotStore(workspace / "snapshots"))
+    result = run_research(workspace, snapshot_id, SMALL)
+    report = json.loads(result.report_path.read_text(encoding="utf-8"))
+    portfolio = report["portfolio"]
+    holdout_start = pd.Timestamp(report["chronology"]["final_holdout"]["start"])
+
+    assert set(portfolio["predictors"]) == {
+        "quorum.momentum",
+        "quorum.trend",
+        "quorum.mean_reversion",
+        "ensemble",
+        "stacker.ridge",
+    }
+    assert {"total_return", "sharpe", "max_drawdown"} <= set(
+        portfolio["equal_weight_benchmark"]
+    )
+    for name, modes in portfolio["predictors"].items():
+        declared = ["frictionless", "slippage-5bp", "slippage-15bp"]
+        assert set(modes) == set(declared)
+        returns = [modes[mode]["total_return"] for mode in declared]
+        assert returns[0] > returns[1] > returns[2], name
+
+        for mode in modes:
+            artifacts = result.run_dir / "portfolio" / name / mode / "artifacts"
+            equity = pd.read_csv(artifacts / "equity.csv", parse_dates=["timestamp"])
+            assert (equity["timestamp"] < holdout_start).all()
+            # The engine executes each target one bar after the adapter emits it.
+            requested = pd.read_csv(
+                result.run_dir / "portfolio" / name / "signals.csv",
+                index_col=0,
+                parse_dates=True,
+            )
+            executed = pd.read_csv(
+                artifacts / "target_positions.csv", index_col=0, parse_dates=True
+            )
+            expected = requested.shift(1).fillna(0.0).reindex(executed.index)
+            pd.testing.assert_frame_equal(
+                executed[sorted(executed.columns)],
+                expected[sorted(executed.columns)],
+                check_names=False,
+                check_freq=False,
+                atol=1e-12,
+            )
+
+
+VARIANTS = {
+    "long_only_tilt": {"portfolio_construction": "long_only_tilt"},
+    "weekly_rebalance": {"rebalance_every_bars": 5},
+    "rolling_stacker": {"stacker_window_bars": 40},
+}
+
+
+def _small(overrides: dict) -> ResearchConfig:
+    from dataclasses import replace
+
+    return replace(SMALL, **overrides)
+
+
+def test_preregistration_registers_every_variant_before_any_result(
+    tmp_path: Path,
+) -> None:
+    from src.quorum.research import preregister, run_preregistered
+
+    workspace = tmp_path / "workspace"
+    snapshot_id = _ingest(DatasetSnapshotStore(workspace / "snapshots"))
+    configs = {name: _small(o) for name, o in VARIANTS.items()}
+
+    declared = preregister(workspace, snapshot_id, "family-a", configs)
+    with pytest.raises(FileExistsError):
+        preregister(workspace, snapshot_id, "family-a", configs)
+    results = run_preregistered(workspace, "family-a")
+
+    ledger = ExperimentLedger(workspace / "experiment_ledger.jsonl")
+    history = ledger.history()
+    registrations = [
+        i for i, r in enumerate(history) if isinstance(r, ExperimentAttempt)
+    ]
+    first_result = min(
+        i for i, r in enumerate(history) if isinstance(r, ExperimentEvent)
+    )
+    assert max(registrations) < first_result
+    assert set(results) == set(VARIANTS)
+    for name, result in results.items():
+        assert result.attempt_id == declared[name]
+        assert ledger.get(result.attempt_id).state is ExperimentState.COMPLETED
+
+    # Registered attempts run once, and only with their registered science.
+    with pytest.raises(ValueError, match="REGISTERED"):
+        run_research(
+            workspace,
+            snapshot_id,
+            configs["weekly_rebalance"],
+            attempt_id=declared["weekly_rebalance"],
+        )
+    fresh = preregister(
+        workspace, snapshot_id, "family-b", {"x": configs["long_only_tilt"]}
+    )
+    with pytest.raises(ValueError, match="spec"):
+        run_research(workspace, snapshot_id, SMALL, attempt_id=fresh["x"])
+
+    tilt = results["long_only_tilt"].run_dir / "portfolio" / "stacker.ridge"
+    tilt_targets = pd.read_csv(tilt / "signals.csv", index_col=0)
+    assert (tilt_targets >= 0.0).all().all()
+    assert (tilt_targets.abs().sum(axis=1) <= 1.0 + 1e-12).all()
+
+    weekly = results["weekly_rebalance"].run_dir / "portfolio" / "stacker.ridge"
+    weekly_targets = pd.read_csv(weekly / "signals.csv", index_col=0)
+    changes = weekly_targets.diff().abs().sum(axis=1).to_numpy().nonzero()[0]
+    assert len(changes) > 0 and all(position % 5 == 0 for position in changes)
+
+    rolling = json.loads(results["rolling_stacker"].report_path.read_text("utf-8"))
+    assert all(
+        fold["model"]["train_rows"] <= 40 * 2 for fold in rolling["stacker"]["folds"]
+    )
+
+
+V1_EXPERTS = {
+    "quorum.volatility_regime",
+    "quorum.overnight_momentum",
+    "quorum.abnormal_volume",
+    "quorum.range_reversal",
+}
+
+
+def test_v1_round_reports_standalone_regime_and_incremental_information(
+    tmp_path: Path,
+) -> None:
+    from dataclasses import replace
+
+    workspace = tmp_path / "workspace"
+    frames = {
+        name: _frame(seed, pd.bdate_range("2021-01-04", periods=700))
+        for seed, name in enumerate(("AAA.US", "BBB.US"))
+    }
+    snapshot_id = _ingest(DatasetSnapshotStore(workspace / "snapshots"), frames)
+    config = replace(SMALL, expert_set="v1", minimum_train_bars=260)
+    report = json.loads(
+        run_research(workspace, snapshot_id, config).report_path.read_text("utf-8")
+    )
+    test = report["evaluation"]["roles"]["test"]
+
+    stackers = {"stacker.ridge", "stacker.all"} | {
+        f"stacker.v0+{name}" for name in V1_EXPERTS
+    }
+    v0 = {"quorum.momentum", "quorum.trend", "quorum.mean_reversion"}
+    assert set(test["predictors"]) == (
+        v0 | V1_EXPERTS | {"ensemble", "ensemble.all"} | stackers
+    )
+    assert set(test["regime_ic"]["quorum.trend"]) <= {"high", "low", "unknown"}
+
+    incremental = report["incremental"]
+    assert incremental["criteria"] == {
+        "orthogonal_max_abs_corr": 0.5,
+        "incremental_min_t": 2.5,
+    }
+    assert set(incremental["experts"]) == V1_EXPERTS | {"all"}
+    for name in V1_EXPERTS:
+        entry = incremental["experts"][name]
+        corr = test["score_correlation"][name]
+        assert entry["max_abs_corr_with_v0"] == pytest.approx(
+            max(abs(corr[v]) for v in v0)
+        )
+        assert entry["orthogonal"] is (entry["max_abs_corr_with_v0"] <= 0.5)
+        delta = entry["delta_vs_v0_stacker"]
+        assert entry["adds_incremental_information"] is bool(
+            delta["t"] is not None and delta["mean_delta"] > 0 and delta["t"] >= 2.5
+        )
+    assert set(report["portfolio"]["predictors"]) == set(test["predictors"])

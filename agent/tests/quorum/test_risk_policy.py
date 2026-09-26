@@ -213,6 +213,22 @@ def test_gross_cap_scales_proportionally_and_preserves_sign() -> None:
     assert rebalance.final_gross == pytest.approx(0.5)
 
 
+def test_gross_scaling_rounding_never_leaves_the_portfolio_above_its_cap() -> None:
+    # Found on real data: dividing by the gross sum overshot 1.0 by one ulp,
+    # so the zero-leverage record rejected an otherwise compliant portfolio.
+    scores = (0.121, -0.975, 0.483, -0.328, -0.909, -0.438, -0.52, 0.906)
+    rows = tuple(_row(f"A{i}", score) for i, score in enumerate(scores))
+
+    rebalance = _policy(gross=1.0, name=0.25).apply(_ensemble(rows)).rebalances[0]
+
+    constrained = [t.gross_constrained_target_weight for t in rebalance.targets]
+    final = [t.final_target_weight for t in rebalance.targets]
+    assert math.fsum(abs(w) for w in constrained) <= 1.0
+    assert math.fsum(abs(w) for w in final) <= 1.0
+    assert rebalance.final_gross <= 1.0
+    assert rebalance.final_gross == pytest.approx(1.0)
+
+
 def test_gross_under_cap_is_not_scaled_up_and_long_short_uses_absolute_gross() -> None:
     under = _policy(gross=1.0, name=0.4).apply(_ensemble((_row("A", 0.5),)))
     mixed = _policy(gross=1.0, name=0.4).apply(

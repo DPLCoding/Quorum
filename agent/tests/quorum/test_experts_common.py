@@ -178,13 +178,17 @@ def test_every_scientific_identity_and_parameter_rejects_runtime_mutation(
     assert expert_type().predict(data, context).to_json() == baseline  # type: ignore[attr-defined]
 
 
-def test_experts_package_exports_only_three_public_experts() -> None:
+def test_experts_package_exports_only_the_frozen_v0_and_v1_experts() -> None:
     import src.quorum.experts as experts_package
 
     assert experts_package.__all__ == [
+        "AbnormalVolumeExpert",
         "MeanReversionExpert",
         "MomentumExpert",
+        "OvernightMomentumExpert",
+        "RangeReversalExpert",
         "TrendExpert",
+        "VolatilityRegimeExpert",
     ]
 
 

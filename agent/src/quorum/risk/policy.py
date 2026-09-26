@@ -391,6 +391,13 @@ def _calculate_portfolio(
         if proposed_gross > config.max_gross_exposure
         else 1.0
     )
+    # Dividing by the gross sum can overshoot the cap by an ulp; step the scale
+    # down until the exact sum complies, so records never carry leverage.
+    while gross_scale < 1.0 and (
+        math.fsum(abs(weight * gross_scale) for _, weight in proposed)
+        > config.max_gross_exposure
+    ):
+        gross_scale = math.nextafter(gross_scale, 0.0)
     gross_constrained = tuple(
         (asset, weight * gross_scale) for asset, weight in proposed
     )
@@ -409,6 +416,17 @@ def _calculate_portfolio(
         )
         for asset, weight in gross_constrained
     )
+    # Interpolating between two compliant portfolios can also round an ulp
+    # over; shrink only such rounding-level excess (larger excess still fails).
+    shrink = 1.0
+    while (
+        config.max_gross_exposure
+        < math.fsum(abs(weight * shrink) for _, weight in final)
+        <= config.max_gross_exposure + _INVARIANT_TOLERANCE
+    ):
+        shrink = math.nextafter(shrink, 0.0)
+    if shrink != 1.0:
+        final = tuple((asset, weight * shrink) for asset, weight in final)
     final_gross = math.fsum(abs(weight) for _, weight in final)
     realized_turnover = math.fsum(
         abs(weight - previous[asset]) for asset, weight in final

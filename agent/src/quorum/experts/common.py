@@ -194,3 +194,73 @@ def _prediction_result(
             ),
         )
     )
+
+
+_OHLCV_FIELDS = frozenset(
+    {"asset", "open", "high", "low", "close", "volume", "event_at", "available_at"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedOHLCVSeries:
+    """Immutable normalized copy of one approved OHLCV history."""
+
+    asset: str
+    open: tuple[float | None, ...]
+    high: tuple[float | None, ...]
+    low: tuple[float | None, ...]
+    close: tuple[float | None, ...]
+    volume: tuple[float | None, ...]
+    event_at: tuple[datetime, ...]
+    available_at: tuple[datetime, ...]
+
+
+def _volume_value(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError("volume values must be real numbers, None, or NaN")
+    result = float(value)
+    if math.isnan(result):
+        return None
+    if not math.isfinite(result) or result < 0.0:
+        raise ValueError("volume values must be finite and non-negative")
+    return result
+
+
+def _normalize_prepared_ohlcv_series(
+    prepared_data: Mapping[str, object],
+    context: PredictionContext,
+) -> _PreparedOHLCVSeries:
+    """Validate the v1 OHLCV contract; timing rules are the close contract's.
+
+    Every value of a bar, its open included, is available at that bar's
+    ``available_at``; the shared check rejects any row later than the cutoff.
+    """
+    if not isinstance(prepared_data, Mapping):
+        raise TypeError("prepared_data must be a mapping")
+    if set(prepared_data) != _OHLCV_FIELDS:
+        raise ValueError(
+            f"invalid prepared_data fields: expected {sorted(_OHLCV_FIELDS)}"
+        )
+    close_series = _normalize_prepared_close_series(
+        {
+            key: prepared_data[key]
+            for key in ("asset", "close", "event_at", "available_at")
+        },
+        context,
+    )
+    columns = {}
+    for name in ("open", "high", "low", "volume"):
+        values = _sequence(name, prepared_data[name])
+        if len(values) != len(close_series.close):
+            raise ValueError(f"{name} must have the same length as close")
+        convert = _volume_value if name == "volume" else _close_value
+        columns[name] = tuple(convert(value) for value in values)
+    return _PreparedOHLCVSeries(
+        asset=close_series.asset,
+        close=close_series.close,
+        event_at=close_series.event_at,
+        available_at=close_series.available_at,
+        **columns,
+    )
