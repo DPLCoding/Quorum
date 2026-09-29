@@ -76,6 +76,8 @@ until 2028-09-26. It compares four long-only candidates:
      that skips 2020–2022. Preregister it before running; it is research
      first, and a V2 prospective study follows only if it beats the control
      out of sample.
+     Design draft: [DIVERSIFIED_DESIGN.md](DIVERSIFIED_DESIGN.md) (under
+     review; three open questions at the end).
 2. **Survivorship-aware universe study (design document only).** This gates all
    cross-sectional research. Investigate sources of point-in-time index
    membership and delisted or acquired companies, their cost and licensing, how
