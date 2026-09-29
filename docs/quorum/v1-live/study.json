@@ -1,0 +1,243 @@
+{
+  "abstention": "if any symbol lacks a candidate score, that candidate records no targets for the day; its previous weights are held and the day is excluded from its risk-policy history",
+  "broker": null,
+  "candidates": {
+    "ensemble_tilt": {
+      "definition": "static V0 ensemble: fsum(w_i * score_i) with w_i = 1/3 over quorum.momentum, quorum.trend, quorum.mean_reversion; abstains when any member abstains",
+      "predictor": "ensemble"
+    },
+    "equal_weight_control": {
+      "definition": "equal-weight fully-invested control: score 0 for every symbol gives tilt 0.5, so proposed weight 0.5 * (2/N) = 1/N per symbol (0.125 for N = 8) and gross N * 1/N = 1.0, within the cap. From all cash the 0.5 turnover cap halves the first decision (0.0625 each, gross 0.5); the second reaches 0.125 each, gross 1.0. It is rebalanced back to 1/N at every valid execution from its drifted weights, paying costs on the actual trades, exactly like every other candidate",
+      "predictor": "constant:0"
+    },
+    "trend_tilt": {
+      "definition": "quorum.trend score (SMA10 vs SMA50) used directly",
+      "predictor": "quorum.trend"
+    },
+    "vol_regime_tilt": {
+      "definition": "quorum.volatility_regime score used directly; the one confirmatory hypothesis",
+      "predictor": "quorum.volatility_regime"
+    }
+  },
+  "code": {
+    "clean": true,
+    "commit": "3e89f8bc7162767afba47a3fc11b96e92c4b5e75"
+  },
+  "confirmatory_test": {
+    "against": "equal_weight_control",
+    "alpha": 0.05,
+    "always_reported": {
+      "n": "number of paired daily observations",
+      "p_value_one_sided": "bootstrap (1 + #{T* >= T}) / (resamples + 1)",
+      "result": "the outcome given by outcome_mapping",
+      "sharpe_difference_annualized": "observed Sharpe(vol_regime_tilt) - Sharpe(equal_weight_control) from daily moments (mean / population std), times sqrt(252)",
+      "studentized_statistic": "T = daily Sharpe difference / its Newey-West HAC delta-method standard error"
+    },
+    "candidate": "vol_regime_tilt",
+    "effect": "annualized Sharpe(vol_regime_tilt) - Sharpe(equal_weight_control)",
+    "exploratory_candidates": [
+      "ensemble_tilt",
+      "trend_tilt"
+    ],
+    "hypothesis": "the preregistered volatility-regime tilt improves prospective risk-adjusted performance relative to the equal-weight fully-invested control",
+    "method": {
+      "block_length": "round(n ** (1/3))",
+      "bootstrap_standard_error": "block-sum covariance of each resample",
+      "implementation": "src.quorum.evaluation.sharpe_difference_test",
+      "name": "Ledoit-Wolf (2008) studentized circular block bootstrap",
+      "p_value": "(1 + #{T* >= T}) / (resamples + 1), one-sided",
+      "resamples": 10000,
+      "seed": 0,
+      "series": "paired daily open-to-open returns over the common span",
+      "standard_error": "delta method on moments (a, b, a^2, b^2) with a Newey-West (Bartlett) HAC, lag = block length"
+    },
+    "minimum_days": 250,
+    "n_definition": "number of paired daily open-to-open returns of vol_regime_tilt and equal_weight_control over their common evaluation span",
+    "outcome_mapping": [
+      {
+        "outcome": "insufficient_observations",
+        "when": "n < 250"
+      },
+      {
+        "outcome": "supported",
+        "when": "n >= 250 and p_value_one_sided <= 0.05"
+      },
+      {
+        "outcome": "not_supported",
+        "when": "n >= 250 and p_value_one_sided > 0.05"
+      }
+    ],
+    "outcomes": [
+      "supported",
+      "not_supported",
+      "insufficient_observations"
+    ],
+    "power_note": "simulated power at 2 years and 0.95 correlation is about 22% for a true +0.2 annual Sharpe gain and about 59% for +0.5, so not_supported is not evidence of no effect",
+    "reporting_rule": "all always_reported fields appear in every evaluation, including interim and insufficient_observations ones; interim values are descriptive only; statistic fields are null only when the bootstrap cannot run (fewer than two blocks)",
+    "secondary_descriptive": [
+      "mean excess return",
+      "annualized return and volatility",
+      "downside volatility",
+      "max drawdown",
+      "tracking error and information ratio",
+      "turnover and costs",
+      "gross exposure and cash weight"
+    ],
+    "uncertainty": "the procedure produces no confidence interval; it also reports standard_error_daily, the HAC delta-method standard error of the daily Sharpe difference"
+  },
+  "construction": {
+    "name": "long_only_tilt",
+    "proposed_weight": "tilt * max_abs_weight_per_asset",
+    "tilt": "(1 + score) / 2, in [0, 1]"
+  },
+  "corporate_actions": "provider adjustment only; evaluation reads opens from the most recent decision's snapshot, so dividends count as return and splits are continuous",
+  "costs": {
+    "application": "each valid execution pays rate * sum_i |target_i - pre_trade_i| of pre-trade equity, where pre_trade_i are the drifted weights (L1 turnover of the actual trades); targets are fractions of post-cost equity",
+    "borrow": "not applicable (long-only)",
+    "cash_return": 0.0,
+    "commission": 0.0,
+    "model": "proportional slippage on traded weight",
+    "rate": 0.0005
+  },
+  "data": {
+    "interval": "1D",
+    "loader_bar_validation": "validate_ohlc: high/low excursions <= 1e-9 relative are snapped; genuine OHLC violations are dropped by the loader",
+    "lookback_calendar_days": 550,
+    "price_adjustment": "provider auto_adjust=True: OHLC adjusted for splits and dividends; volume split-adjusted",
+    "session": {
+      "close": "16:00",
+      "open": "09:30",
+      "timezone": "America/New_York"
+    },
+    "snapshot": "each decision's input bars are a content-addressed snapshot it references",
+    "source": "yfinance via Vibe loader backtest.loaders.yfinance_loader.DataLoader",
+    "timestamp_convention": "bar:[regular-open,regular-close):America/New_York:v1"
+  },
+  "declared_at": "2026-09-26T17:59:13.999838+00:00",
+  "evaluation": {
+    "metrics": [
+      "days and executions",
+      "total_return",
+      "annualized_return = (1 + total_return) ** (252 / days) - 1",
+      "annualized_volatility = sample std of daily returns * sqrt(252)",
+      "downside_volatility = sqrt(mean(min(r, 0) ** 2)) * sqrt(252)",
+      "sharpe = mean / sample std of daily returns * sqrt(252), zero risk-free",
+      "max_drawdown of the daily equity curve",
+      "avg_gross_exposure and avg_cash_weight, averaged over daily post-trade marks",
+      "total_turnover, avg_turnover_per_execution, total_cost",
+      "vs_control: daily excess mean (annualized), t, tracking error, information ratio"
+    ],
+    "series": "daily open-to-open returns from the first valid execution's open to the last observed open, identical dates for every candidate",
+    "status": "interim until the New York date passes end_date; interim results are descriptive only and cannot alter this study",
+    "study_counts": [
+      "decisions",
+      "late",
+      "pending",
+      "missed sessions",
+      "skips"
+    ]
+  },
+  "execution": {
+    "fill": "open of the first bar after the decision bar (next session open, 09:30 New York)",
+    "holding": "between valid executions each position drifts with its own open-to-open price and cash earns 0; at each valid execution the portfolio trades from its drifted pre-trade weights to the targets",
+    "late_rule": "a decision counts only if recorded_at < that bar's start; a late decision never counts and the previous weights are held",
+    "marking": "every candidate is marked to market at every session open",
+    "orders": "hypothetical only; no broker and no order path"
+  },
+  "expert_specifications": [
+    "docs/quorum/ARCHITECTURE.md (Task 4 deterministic V0 experts)",
+    "docs/quorum/EXPERTS_V1.md"
+  ],
+  "experts": {
+    "quorum.abnormal_volume": {
+      "config_id": "quorum:abnormal-volume:v1",
+      "version": "v1.0.0"
+    },
+    "quorum.mean_reversion": {
+      "config_id": "quorum:mean-reversion:v0",
+      "version": "v0.1.0"
+    },
+    "quorum.momentum": {
+      "config_id": "quorum:momentum:v0",
+      "version": "v0.1.0"
+    },
+    "quorum.overnight_momentum": {
+      "config_id": "quorum:overnight-momentum:v1",
+      "version": "v1.0.0"
+    },
+    "quorum.range_reversal": {
+      "config_id": "quorum:range-reversal:v1",
+      "version": "v1.0.0"
+    },
+    "quorum.trend": {
+      "config_id": "quorum:trend:v0",
+      "version": "v0.1.0"
+    },
+    "quorum.volatility_regime": {
+      "config_id": "quorum:volatility-regime:v1",
+      "version": "v1.0.0"
+    }
+  },
+  "external_reference": {
+    "name": "SPY.US buy and hold",
+    "rule": "descriptive only and never part of the confirmatory test: bought at the first valid execution's open paying the declared rate once, then held and marked daily; omitted if SPY.US is not in the universe"
+  },
+  "horizon": {
+    "concurrency": "materially changed systems receive new study IDs and may run concurrently; this study is never modified",
+    "end_date": "2028-09-26",
+    "rule": "no run is accepted after end_date (New York date); no early stopping for performance; the final evaluation is the first after end_date",
+    "start": "the first decision recorded after declaration"
+  },
+  "information_cutoff": {
+    "decision_at": "that bar's close",
+    "decision_bar": "the latest bar closed for every symbol",
+    "recorded_at": "the actual run time; never backdated",
+    "rule": "a bar is used only if its close (event_at) <= recorded_at, the run's wall clock",
+    "unclosed_bars": "excluded and counted in the decision record"
+  },
+  "initial_state": {
+    "equity": 1.0,
+    "ramp": "the turnover cap limits target gross to 0.5 after the first decision; the control reaches 1.0 at the second",
+    "weights": "all cash: 0 for every symbol"
+  },
+  "missed_runs": {
+    "catch_up": "a later run decides only the latest closed session, never backdates, and is late if it runs after the next open",
+    "reporting": "every session after the first decision without a decision is listed as missed",
+    "rule": "a session with no decision has none; the previous weights are held"
+  },
+  "missing_data": {
+    "calendar_mismatch": "a 'skip' when the symbols' latest 253 closed sessions differ",
+    "fetch_or_validation_failure": "the run appends a 'skip' record with the reason; no decision",
+    "missing_values": "any NaN in a fetched bar fails the run as a 'skip'"
+  },
+  "non_trading_days": "a run with no newly closed session appends nothing and returns 'no_new_session' (weekends, holidays, repeated runs)",
+  "operations": {
+    "note": "scheduling never affects validity; recorded_at and the late rule decide",
+    "schedule": "weekdays 17:00 America/Denver, and as soon as possible after a missed start"
+  },
+  "risk": {
+    "max_abs_weight_per_asset": 0.25,
+    "max_gross_exposure": 1.0,
+    "max_turnover": 0.5,
+    "policy": "src.quorum.risk.FixedRiskPolicy",
+    "rules": "gross above the cap scales all weights proportionally; then L1 turnover above the cap interpolates proportionally from the previous executable targets; no leverage, no shorts; the remainder is cash",
+    "state": "replayed each run over the candidate's full recorded score history",
+    "targets_vs_trades": "the policy is price-unaware, as in research: its turnover cap limits changes between successive targets, while actual trades run from drifted pre-trade weights to the targets and may differ"
+  },
+  "schema_version": 2,
+  "study_id": "quorum-prospective-v1",
+  "universe": {
+    "membership": "fixed for the whole study; nothing added, removed, or replaced",
+    "selection_note": "large US ETFs and stocks chosen in 2026: survivorship-selected",
+    "symbols": [
+      "AAPL.US",
+      "IWM.US",
+      "JNJ.US",
+      "JPM.US",
+      "MSFT.US",
+      "QQQ.US",
+      "SPY.US",
+      "XOM.US"
+    ]
+  }
+}

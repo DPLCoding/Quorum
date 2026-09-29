@@ -1,6 +1,6 @@
 # Quorum status and next steps
 
-Last updated: 2026-09-26. Read this first when resuming work. Details live in
+Last updated: 2026-09-28. Read this first when resuming work. Details live in
 [ARCHITECTURE.md](ARCHITECTURE.md) (Tasks 1–15), [ROADMAP.md](ROADMAP.md),
 [RESEARCH_PRINCIPLES.md](RESEARCH_PRINCIPLES.md), and
 [EXPERTS_V1.md](EXPERTS_V1.md).
@@ -66,14 +66,16 @@ until 2028-09-26. It compares four long-only candidates:
 
 ## Next steps, in priority order
 
-1. **Check V1 after its first unattended run** (Monday 2026-09-28 17:00).
-   Confirm that:
-   - Friday's decision executed at Monday's open;
-   - Monday's decision was recorded;
-   - the backup checkpoint matches.
-
-   Optionally add a small read-only status script to this repository (never to
-   V1's code) for a weekly check.
+1. **V1 first unattended run: done** (Monday 2026-09-28 17:00). Friday's
+   decision executed at Monday's open, Monday's decision was recorded, and the
+   backup mirror updated. Live results are published to
+   [v1-live/](v1-live/README.md) with `agent/scripts/publish_quorum_v1.py`;
+   rerun it and commit to refresh.
+   - **Next:** a diversified research family: a broader universe (more asset
+     classes, sectors, and Nasdaq exposure) with training data from 2005–2025
+     that skips 2020–2022. Preregister it before running; it is research
+     first, and a V2 prospective study follows only if it beats the control
+     out of sample.
 2. **Survivorship-aware universe study (design document only).** This gates all
    cross-sectional research. Investigate sources of point-in-time index
    membership and delisted or acquired companies, their cost and licensing, how
