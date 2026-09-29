@@ -174,6 +174,18 @@ def validate_ohlc(
         return frame
 
     open_, high, low, close = (frame[c] for c in required)
+    # Price adjustment can leave a close at the high/low one rounding error
+    # outside it; snap those back instead of dropping a real trading day.
+    tolerance = 1e-9 * frame[list(required)].abs().max(axis=1)
+    body_high = pd.concat([open_, close], axis=1).max(axis=1)
+    body_low = pd.concat([open_, close], axis=1).min(axis=1)
+    snap_high = (high < body_high) & (body_high - high <= tolerance)
+    snap_low = (low > body_low) & (low - body_low <= tolerance)
+    if snap_high.any() or snap_low.any():
+        frame = frame.copy()
+        frame.loc[snap_high, "high"] = body_high[snap_high]
+        frame.loc[snap_low, "low"] = body_low[snap_low]
+        open_, high, low, close = (frame[c] for c in required)
     structural = (
         (high < low)
         | (high < open_)

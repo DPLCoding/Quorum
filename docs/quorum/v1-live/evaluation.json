@@ -1,0 +1,118 @@
+{
+  "candidates": {
+    "ensemble_tilt": {
+      "annualized_return": -0.06106392169418573,
+      "annualized_volatility": null,
+      "avg_cash_weight": 0.5,
+      "avg_gross_exposure": 0.5,
+      "avg_turnover_per_execution": 0.5,
+      "days": 1,
+      "downside_volatility": 0.003968626966596449,
+      "executions": 1,
+      "max_drawdown": -0.00024999999999997247,
+      "sharpe": null,
+      "total_cost": 0.00025,
+      "total_return": -0.00024999999999997247,
+      "total_turnover": 0.5,
+      "vs_control": {
+        "days": 1,
+        "excess_t": null,
+        "information_ratio": null,
+        "mean_excess_annualized": 0.0,
+        "tracking_error": null
+      }
+    },
+    "equal_weight_control": {
+      "annualized_return": -0.06106392169418573,
+      "annualized_volatility": null,
+      "avg_cash_weight": 0.5,
+      "avg_gross_exposure": 0.5,
+      "avg_turnover_per_execution": 0.5,
+      "days": 1,
+      "downside_volatility": 0.003968626966596449,
+      "executions": 1,
+      "max_drawdown": -0.00024999999999997247,
+      "sharpe": null,
+      "total_cost": 0.00025,
+      "total_return": -0.00024999999999997247,
+      "total_turnover": 0.5
+    },
+    "trend_tilt": {
+      "annualized_return": -0.06106392169418573,
+      "annualized_volatility": null,
+      "avg_cash_weight": 0.49999999999999994,
+      "avg_gross_exposure": 0.5000000000000001,
+      "avg_turnover_per_execution": 0.5,
+      "days": 1,
+      "downside_volatility": 0.003968626966596449,
+      "executions": 1,
+      "max_drawdown": -0.00024999999999997247,
+      "sharpe": null,
+      "total_cost": 0.00025,
+      "total_return": -0.00024999999999997247,
+      "total_turnover": 0.5,
+      "vs_control": {
+        "days": 1,
+        "excess_t": null,
+        "information_ratio": null,
+        "mean_excess_annualized": 0.0,
+        "tracking_error": null
+      }
+    },
+    "vol_regime_tilt": {
+      "annualized_return": -0.06106392169418573,
+      "annualized_volatility": null,
+      "avg_cash_weight": 0.49999999999999994,
+      "avg_gross_exposure": 0.5000000000000001,
+      "avg_turnover_per_execution": 0.5000000000000001,
+      "days": 1,
+      "downside_volatility": 0.003968626966596449,
+      "executions": 1,
+      "max_drawdown": -0.00024999999999997247,
+      "sharpe": null,
+      "total_cost": 0.00025000000000000006,
+      "total_return": -0.00024999999999997247,
+      "total_turnover": 0.5000000000000001,
+      "vs_control": {
+        "days": 1,
+        "excess_t": null,
+        "information_ratio": null,
+        "mean_excess_annualized": 0.0,
+        "tracking_error": null
+      }
+    }
+  },
+  "confirmatory_test": {
+    "final": false,
+    "n": 1,
+    "p_value_one_sided": null,
+    "result": "insufficient_observations",
+    "sharpe_difference_annualized": null,
+    "studentized_statistic": null
+  },
+  "decisions": 2,
+  "external_reference": {
+    "annualized_return": -0.11841293290699573,
+    "annualized_volatility": null,
+    "avg_cash_weight": 0.0,
+    "avg_gross_exposure": 1.0,
+    "avg_turnover_per_execution": 1.0,
+    "days": 1,
+    "downside_volatility": 0.007937253933192898,
+    "executions": 1,
+    "max_drawdown": -0.0004999999999999449,
+    "name": "SPY.US buy and hold",
+    "sharpe": null,
+    "total_cost": 0.0005,
+    "total_return": -0.0004999999999999449,
+    "total_turnover": 1.0
+  },
+  "late_decisions": [],
+  "missed_sessions": [],
+  "pending_decisions": [
+    "2026-09-28"
+  ],
+  "skips": 1,
+  "status": "interim",
+  "study_id": "quorum-prospective-v1"
+}

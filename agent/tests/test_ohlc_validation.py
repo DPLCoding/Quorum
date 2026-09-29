@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -36,6 +37,32 @@ def test_validate_ohlc_drops_invariant_violations() -> None:
 
     assert list(cleaned["close"]) == [10.5, 10.0]
     assert len(cleaned) == 2
+
+
+def test_validate_ohlc_snaps_adjustment_rounding_instead_of_dropping_the_day() -> None:
+    """Split/dividend adjustment can push a close-at-the-low one ulp outside.
+
+    Seen in yfinance ``auto_adjust`` data (e.g. XOM 2007-12-27): dropping the
+    bar deletes a real trading day, so rounding-level excursions are snapped
+    back onto the high/low while genuine violations are still dropped.
+    """
+    close = 48.213837
+    low = math.nextafter(close, math.inf)  # low one ulp above the close
+    high = 48.888123
+    frame = _frame(
+        [
+            (48.800617, high, low, close, 1000.0),
+            (10.0, 10.5, 9.0, 10.6, 1000.0),  # close 1% above high -> invalid
+        ]
+    )
+
+    cleaned = validate_ohlc(frame)
+
+    assert list(cleaned.index) == [frame.index[0]]
+    row = cleaned.iloc[0]
+    assert row["low"] == close
+    assert row["high"] == high
+    assert row["low"] <= min(row["open"], row["close"])
 
 
 def test_validate_ohlc_raise_strategy() -> None:
