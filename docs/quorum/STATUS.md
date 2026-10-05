@@ -57,7 +57,7 @@ until 2028-09-26. It compares four long-only candidates:
 - **It is immutable.** Never modify its declaration, ledger, snapshots, pinned
   code export, or isolated runtime. Improvements go into a new study ID, which
   can run concurrently.
-- It records a decision every weekday at 17:00 America/Denver from a pinned
+- It records a decision every weekday at 22:00 America/Denver (17:00 until 2026-10-05, see the V1 addendum) from a pinned
   code export and a frozen Python runtime, both outside this repository.
   Operations, verification commands, and restore steps are in the local runbook
   in the V1 workspace (`C:\quorum-ws\README.md`).
