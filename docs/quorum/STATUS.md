@@ -78,7 +78,7 @@ until 2028-09-26. It compares four long-only candidates:
      reported as such.
    - **Research workspace** (trial ledger with 12 attempts, preregistrations,
      snapshots, runs) moved out of a temp folder on 2026-10-05 to the local V1
-     machine's `C:\quorum-wsesearch`, plus a OneDrive copy. All 220 file
+     machine's `C:\quorum-ws\research`, plus a OneDrive copy. All 220 file
      hashes were verified.
    - **Next:** a diversified research family: a broader universe (more asset
      classes, sectors, and Nasdaq exposure) with training data from 2005–2025
