@@ -1,6 +1,6 @@
 # Quorum status and next steps
 
-Last updated: 2026-09-28. Read this first when resuming work. Details live in
+Last updated: 2026-10-05. Read this first when resuming work. Details live in
 [ARCHITECTURE.md](ARCHITECTURE.md) (Tasks 1–15), [ROADMAP.md](ROADMAP.md),
 [RESEARCH_PRINCIPLES.md](RESEARCH_PRINCIPLES.md), and
 [EXPERTS_V1.md](EXPERTS_V1.md).
@@ -71,6 +71,15 @@ until 2028-09-26. It compares four long-only candidates:
    backup mirror updated. Live results are published to
    [v1-live/](v1-live/README.md) with `agent/scripts/publish_quorum_v1.py`;
    rerun it and commit to refresh.
+   - **Missed sessions:** 2026-09-29, 09-30, and 10-01 have no decision. On
+     09-29 the laptop was asleep at 17:00 after an unclean power loss, and
+     catch-up did not fire. On 09-30 and 10-01 the cause is unknown: Task
+     Scheduler history is disabled. Missed sessions are permanent and are
+     reported as such.
+   - **Research workspace** (trial ledger with 12 attempts, preregistrations,
+     snapshots, runs) moved out of a temp folder on 2026-10-05 to the local V1
+     machine's `C:\quorum-wsesearch`, plus a OneDrive copy. All 220 file
+     hashes were verified.
    - **Next:** a diversified research family: a broader universe (more asset
      classes, sectors, and Nasdaq exposure) with training data from 2005–2025
      that skips 2020–2022. Preregister it before running; it is research
@@ -98,9 +107,12 @@ until 2028-09-26. It compares four long-only candidates:
 
 ## Open decisions
 
-- **V1 retry run.** A transient Yahoo failure on a real evening becomes a
-  missed session. Adding an evening retry changes V1's frozen operations text,
-  so decide after watching a few weeks of runs.
+- **V1 retry run.** A transient Yahoo failure, or a machine that is off at
+  17:00, becomes a missed session (three already). Extra triggers are safe:
+  `record` is idempotent (`no_new_session`) and the declaration says
+  scheduling never affects validity. The schedule text is part of the frozen
+  operations section, though, so a change needs a written addendum like the
+  runtime one.
 - **Commit email.** Commits use `DPLCoding` with a public university email.
   Optionally switch future commits to the GitHub noreply address.
 
