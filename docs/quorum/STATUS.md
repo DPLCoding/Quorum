@@ -83,13 +83,18 @@ until 2028-09-26. It compares four long-only candidates:
      snapshots, runs) moved out of a temp folder on 2026-10-05 to the local V1
      machine's `C:\quorum-ws\research`, plus a OneDrive copy. All 220 file
      hashes were verified.
-   - **Next:** a diversified research family: a broader universe (more asset
-     classes, sectors, and Nasdaq exposure) with training data from 2005–2025
-     that skips 2020–2022. Preregister it before running; it is research
-     first, and a V2 prospective study follows only if it beats the control
-     out of sample.
-     Design draft: [DIVERSIFIED_DESIGN.md](DIVERSIFIED_DESIGN.md) (under
-     review; three open questions at the end).
+   - **Next: V1.1**, the research family `v1.1-diversified`. It applies V1's
+     frozen experts to 22 ETFs: US broad equity and Nasdaq, sectors,
+     international equity, Treasuries and credit, REITs, and gold. The data
+     run from 2005 to 2025 with 2025 locked, and 2020–2022 is excluded from
+     stacker training only. The primary test is `stacker.ridge` against equal
+     weight at 15 bp. A `quorum-prospective-v1.1` study follows only if the
+     test passes. The design was approved on 2026-10-06:
+     [DIVERSIFIED_DESIGN.md](DIVERSIFIED_DESIGN.md). Next comes the
+     implementation plan.
+   - **Naming:** V1.x keeps V1's frozen method and changes the universe or
+     operations. V2 is reserved for a major change, such as new kinds of
+     experts or a survivorship-aware stock universe.
 2. **Survivorship-aware universe study (design document only).** This gates all
    cross-sectional research. Investigate sources of point-in-time index
    membership and delisted or acquired companies, their cost and licensing, how
