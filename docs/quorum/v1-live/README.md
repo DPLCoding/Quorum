@@ -9,6 +9,7 @@ files are copied here periodically with `agent/scripts/publish_quorum_v1.py`.
 | `study.json` | the frozen declaration (universe, candidates, costs, confirmatory test) |
 | `ledger.jsonl` | the hash-chained ledger: one declaration, then one decision or skip per trading day |
 | `evaluation.json` | the latest interim evaluation, computed from the ledger and the price snapshots |
+| `freeze_receipt_addendum_*.md` | operational changes since the freeze (run time, wake from sleep). None changes the study. Addendum 1 (runtime isolation) stays local because it contains machine paths. |
 
 Each decision is recorded after the close and executes at the next open. The
 ledger is append-only, so every older line stays byte-identical between

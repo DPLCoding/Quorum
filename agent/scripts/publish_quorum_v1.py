@@ -2,8 +2,10 @@
 
 Read-only against V1 apart from ``evaluation.json``, which ``evaluate`` rewrites.
 Evaluation runs from the pinned export with the frozen runtime, exactly as the
-local runbook does. Freeze receipts and snapshots stay local: the receipts hold
-machine paths and the snapshots hold vendor price data.
+local runbook does. Snapshots stay local because they hold vendor price data.
+The freeze receipts stay local because they hold machine paths. Operational
+addenda (``freeze_receipt_addendum_*.md``) are published unless they contain
+a machine path.
 
     python agent/scripts/publish_quorum_v1.py [--workspace C:\\quorum-ws]
 """
@@ -45,10 +47,18 @@ def main() -> None:
         leak = LEAK.search((source / name).read_text(encoding="utf-8"))
         if leak:
             raise SystemExit(f"refusing to publish {name}: contains {leak.group()!r}")
+    # Operational addenda are optional: publish the ones free of machine details.
+    addenda = []
+    for path in sorted(source.glob("freeze_receipt_addendum_*.md")):
+        leak = LEAK.search(path.read_text(encoding="utf-8"))
+        if leak:
+            print(f"kept local: {path.name} (contains {leak.group()!r})")
+        else:
+            addenda.append(path.name)
     DEST.mkdir(parents=True, exist_ok=True)
-    for name in FILES:
+    for name in (*FILES, *addenda):
         shutil.copyfile(source / name, DEST / name)
-    print(f"published {', '.join(FILES)} to {DEST}")
+    print(f"published {', '.join((*FILES, *addenda))} to {DEST}")
 
 
 if __name__ == "__main__":
