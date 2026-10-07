@@ -79,10 +79,20 @@ until 2028-09-26. It compares four long-only candidates:
      catch-up did not fire. On 09-30 and 10-01 the cause is unknown: Task
      Scheduler history is disabled. Missed sessions are permanent and are
      reported as such.
-   - **Research workspace** (trial ledger with 12 attempts, preregistrations,
-     snapshots, runs) moved out of a temp folder on 2026-10-05 to the local V1
-     machine's `C:\quorum-ws\research`, plus a OneDrive copy. All 220 file
-     hashes were verified.
+   - **Research workspace:** moved out of a temp folder on 2026-10-05 to the
+     local V1 machine's `C:\quorum-ws\research`, plus a OneDrive copy.
+     **Correction (2026-10-06):** Windows temp cleanup had already deleted
+     most of it on 2026-10-03, before the move:
+     - **survived intact:** the trial ledger (12 attempts) and the 4
+       preregistrations;
+     - **lost:** both research snapshots (including the 8-asset 2005–2025
+       data, `67eee713…`), all reports and prediction files, and most run
+       outputs.
+
+     Earlier results stand as reported in these docs, but they cannot be
+     recomputed bit-exactly. Task 1 of the V1.1 plan re-ingests the 8-asset
+     universe as a new golden baseline. The 10-05 note that "all 220 file
+     hashes were verified" was true only of the files that remained.
    - **Next: V1.1**, the research family `v1.1-diversified`. It applies V1's
      frozen experts to 30 ETFs: US broad equity and Nasdaq, all 11
      sectors, international equity, Treasuries, credit and international
@@ -92,8 +102,9 @@ until 2028-09-26. It compares four long-only candidates:
      locked, and 2020–2022 is excluded from stacker training only. The primary test is `stacker.ridge` against equal
      weight at 15 bp. A `quorum-prospective-v1.1` study follows only if the
      test passes. The design was approved on 2026-10-06:
-     [DIVERSIFIED_DESIGN.md](DIVERSIFIED_DESIGN.md). Next comes the
-     implementation plan.
+     [DIVERSIFIED_DESIGN.md](DIVERSIFIED_DESIGN.md). The implementation plan
+     has 8 tasks and is written but not started:
+     [2026-10-06-v1.1-diversified.md](plans/2026-10-06-v1.1-diversified.md).
    - **Naming:** V1.x keeps V1's frozen method and changes the universe or
      operations. V2 is reserved for a major change, such as new kinds of
      experts or a survivorship-aware stock universe.
